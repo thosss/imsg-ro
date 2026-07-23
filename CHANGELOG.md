@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.13.3 - Unreleased
+## 0.13.4 - Unreleased
+
+## 0.13.3 - 2026-07-23
+
+### Highlights
+- macOS 26/27 bridge compatibility is restored for typing/account diagnostics and message editing after IMCore selector drift (thanks @sethdford).
+
+### Advanced IMCore
+- fix: restore typing/account diagnostics and message editing on macOS 26 with current IMCore selectors (#194, thanks @sethdford).
 
 ### Safety
 - feat: add a global `--read-only` flag (and `IMSG_READ_ONLY=1` environment variable) that deterministically refuses every write or mutation across the CLI and JSON-RPC. Read commands are unaffected; write commands exit with a dedicated code (3) and a clear message, and mutating RPC methods return a well-formed JSON-RPC error (`code: -32001`) without breaking the protocol. `imsg status` reports the active mode (`read_only` in `--json`).
