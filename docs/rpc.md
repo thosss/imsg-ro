@@ -124,25 +124,43 @@ the request `id` is echoed and the protocol is never broken:
 ```
 
 The error `code` (`-32005`) is in the JSON-RPC implementation-defined
-server-error range; `data` carries the rejected method name. An unrecognized
-method name is refused too, rather than reaching dispatch.
+server-error range; `data` carries the rejected method name.
+
+A method name that does not exist on this build is refused too — nothing
+reaches dispatch either way — but it answers `-32601` (Method not found)
+rather than `-32005`, which is what read-write mode would say. The two codes
+answer different questions: `-32005` means "this exists and this server will
+not do it", `-32601` means "no such method here". This matters on the Linux
+read-core build, where `handles.check` and `contacts.shouldShareContact` are
+read-lane methods that are simply not compiled in; reporting them as blocked
+mutations would tell a client its *read* was refused for being a write.
 
 > **Changed in 0.14.x:** this error was `-32001` in 0.13.x. Upstream now uses
 > `-32001` for `deliveryFailure` ("Delivery outcome unknown"), so read-only
 > refusals moved to `-32005` to keep the two distinguishable by code — they
 > mean opposite things to a caller deciding whether to retry.
 
-`imsg status --json` reports `read_only: true`, and its `rpc_methods` list is
-filtered to the methods that would actually be accepted, so a capability-aware
-client is not handed a menu of calls that cannot succeed.
+Both `status` and `initialize` report `read_only: true` and filter *both*
+method lists (`methods` and `supported_methods`) to what would actually be
+accepted, so a client negotiating capabilities at `initialize` is not handed a
+menu of calls that cannot succeed. `imsg status --json` does the same for its
+`rpc_methods`.
 
 ## Redacting security codes
 
 Start the server with `imsg rpc --redact-codes` to strip texted security/
 verification codes (2FA, OTP) out of message `text` wherever it appears in
 results and notifications — `messages.history`, `messages.search`,
-`messages.after`, `watch.subscribe`, and `messages.scheduled`. Only the matched
-code token is replaced with `[redacted]`; the rest of the message is untouched.
+`messages.after`, `watch.subscribe`, and `messages.scheduled`. Every matching
+token is replaced with `[redacted]`; the rest of the message is untouched.
+
+Redaction is applied where database rows are decoded rather than in each
+handler, so every method that returns message text inherits it — including
+ones added later, and including `reply_to_text`. `status` and `initialize`
+report `redact_codes`, because unlike a read-only refusal (which announces
+itself) redaction silently changes the content of a successful result, and a
+client caching or forwarding that text has no other way to know.
+
 See the "Redacting security codes" section in the top-level README for how the
 heuristic works and its known limitations. Combine freely with `--read-only`.
 

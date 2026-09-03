@@ -22,6 +22,37 @@
 - `--redact-codes` now also covers the `messages.search` and `messages.after`
   RPC methods introduced upstream. Both return message text and would otherwise
   have been unredacted holes.
+- `--redact-codes` is now applied where database rows are decoded rather than in
+  each command and handler. Redacting at nine call sites was fail-open — a new
+  read path leaked until someone remembered to patch it, which is what happened
+  when `messages.after` arrived — so the policy now lives on the store and every
+  read path inherits it, `reply_to_text` included.
+- `--redact-codes` now replaces **every** matching token instead of the nearest
+  one. Validated against a live `chat.db`: redacting a single token spends the
+  replacement on whichever candidate sits closest to a keyword, which is not
+  always the secret, so "Citi card ending in 8940 … one-time passcode 082156"
+  redacted the card digits and published the passcode. Messages that simply
+  carry two codes were also half-covered. To make redact-all safe, a candidate
+  inside a digit-and-dash run longer than 10 characters is skipped as a phone
+  number.
+- **Fixed (fork):** `launch` was classified as a read, so it ran under
+  `--read-only`. It terminates Messages.app and relaunches it with
+  `DYLD_INSERT_LIBRARIES`, and `--dylib` makes the injected code
+  caller-supplied — arbitrary code inside Messages, which can then send. It is
+  now a write.
+- **Fixed (fork):** `imsg rpc`'s `status` and `initialize` ignored read-only
+  mode, advertising all 43 methods (including every mutating one) and no
+  `read_only` field, so a stdio client could only discover the mode by trial.
+  Both lists are now filtered and both modes reported. The CLI's `status` also
+  reports `redact_codes`.
+- **Fixed (fork):** `imsg completions llm` — the capability manifest an AI agent
+  reads to learn what it may do — ignored the runtime entirely and advertised
+  all 38 commands including `send` and `delete-message`. It now lists only what
+  would run under `--read-only`.
+- Under `--read-only`, a method name that does not exist on this build now
+  answers `-32601` instead of `-32005`. Both are still refused before dispatch;
+  the split matters on the Linux read-core build, where compiled-out *read*
+  methods were being reported as blocked mutations.
 
 ### Fixes
 

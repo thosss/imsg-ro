@@ -88,9 +88,10 @@ are accepted before or after the subcommand, and they combine freely.
 
 Deterministically forbids every write or mutation across all commands and
 `imsg rpc`, so a caller can hand the CLI over knowing it cannot send, react,
-edit, delete, mark read, change chats, or share Name & Photo. Set
-`IMSG_READ_ONLY=1` to enforce it for every child invocation. Either the flag or
-the environment variable is enough — nothing turns it back off.
+edit, delete, mark read, change chats, share Name & Photo, or relaunch
+Messages.app with an injected dylib. Set `IMSG_READ_ONLY=1` to enforce it for
+every child invocation. Either the flag or the environment variable is enough —
+nothing turns it back off.
 
 ```bash
 imsg --read-only history --chat-id 1 --json   # reads work as usual
@@ -105,14 +106,35 @@ Under `imsg rpc --read-only`, mutating methods are refused before dispatch with
 a well-formed JSON-RPC error (`-32005`), so the stream is never broken. The
 permitted set is derived from each method's declared execution lane rather than
 a separate list, so a newly added mutating method is refused by default.
-`imsg status` reports the mode (`read_only` in `--json`) and narrows its
-advertised `rpc_methods` to what would actually be accepted.
+A method that does not exist on this build answers `-32601` (Method not found)
+instead, so a client can tell "refused" from "no such method".
+
+Commands that advertise capability narrow themselves to match, so a consumer is
+never handed a menu of calls that cannot succeed:
+
+- `imsg status` reports the mode (`read_only` in `--json`) and narrows its
+  advertised `rpc_methods`.
+- `imsg rpc`'s `status` and `initialize` report `read_only` and filter both
+  `methods` and `supported_methods`.
+- `imsg completions llm` — the CLI reference an agent reads to learn what it
+  may do — lists only the commands that would run (38 down to 15). The shell
+  completions narrow the same way.
+
+`launch` is classified as a write: it terminates Messages.app and relaunches it
+with `DYLD_INSERT_LIBRARIES`, and its `--dylib` option makes the injected code
+caller-supplied, so permitting it would let a caller run arbitrary code inside
+Messages — which can then send. Start the bridge yourself before handing over a
+read-only session.
 
 ### `--redact-codes`
 
 Strips texted security/verification codes (2FA, OTP, bank and vendor codes) out
 of message text before it is rendered or serialized — `history`, `search`,
 `watch`, `scheduled`, and the equivalent JSON-RPC methods.
+
+Redaction is applied where database rows are decoded, not in each command, so
+every read path inherits it — including quoted reply text and any path added
+later. `imsg status --json` reports `redact_codes`.
 
 ```bash
 imsg --redact-codes history --chat-id 1
@@ -125,9 +147,27 @@ This is a heuristic derived from real SMS OTP formatting, not a guarantee:
   to a 4–10 character digit-and-dash token, in either order — both "code:
   123456" and "123456 is your code" (the autofill-friendly format used by
   Google, PayPal, Coinbase, and others) are handled.
-- Only the matched token is replaced with `[redacted]`; the rest of the message
-  is left intact.
+- **Every** matching token is replaced with `[redacted]`; the rest of the
+  message is left intact. Redacting only the nearest match was a real leak:
+  the token closest to a keyword is not always the secret, so a message
+  reading "Citi card ending in 8940 … enter one-time passcode 082156" spent
+  its one replacement on the card digits and published the passcode. Messages
+  also simply carry two codes ("Alarm Code for Legacy System …" then "Alarm
+  Code for Ring …"), where the second was never considered.
+- A candidate inside a digit-and-dash run longer than 10 characters is skipped
+  as a phone number, so "Didn't request a code? Call 1-800-387-2331" keeps its
+  support number intact.
 - Alphanumeric codes (rare — e.g. "7fpa1i") are **not** redacted.
+- Only the first group of a space-separated multi-group code (e.g. a Pokémon GO
+  trainer code, "4077 6631 9833") is redacted. Digits in the gap between
+  keyword and token end the match, which is deliberate — it is what stops the
+  matcher from reaching past an unmatchable code to a support phone number
+  mentioned later.
+- Street numbers and ZIPs are over-redacted when they sit within 60 characters
+  *before* a code keyword with no digits in between: "1234 Main Street. Alarm
+  code 271828" loses both. ("1234 30th Street" keeps its number, because the
+  digits in "30th" end the match.) This errs toward removing too much rather
+  than too little, and is left as-is.
 - Coupon/discount codes phrased identically to OTP language (e.g. "code
   GREATMOVE15") may also be redacted; treated as an acceptable, low-stakes
   false positive.
