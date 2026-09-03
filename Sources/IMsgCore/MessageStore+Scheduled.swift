@@ -39,23 +39,6 @@ public struct ScheduledMessage: Sendable, Equatable, Codable {
     self.scheduleType = scheduleType
     self.scheduleState = scheduleState
   }
-
-  /// Returns a copy with `text` passed through `SecurityCodeRedactor`.
-  public func redactingSecurityCodes() -> ScheduledMessage {
-    ScheduledMessage(
-      rowID: rowID,
-      guid: guid,
-      chatID: chatID,
-      chatIdentifier: chatIdentifier,
-      chatGUID: chatGUID,
-      chatName: chatName,
-      text: SecurityCodeRedactor.redact(text),
-      service: service,
-      scheduledAt: scheduledAt,
-      scheduleType: scheduleType,
-      scheduleState: scheduleState
-    )
-  }
 }
 
 public enum ScheduledMessagesError: Error, CustomStringConvertible, Equatable, Sendable {
@@ -115,9 +98,14 @@ extension MessageStore {
         bindings: [MessageStore.appleEpoch(asOf), limit])
       while let row = try rows.failableNext() {
         let rawText = try stringValue(row, "text")
-        let text =
+        var text =
           rawText.isEmpty
           ? TypedStreamParser.parseAttributedBody(try dataValue(row, "body")) : rawText
+        // Scheduled messages run their own query rather than `decodeMessageRow`,
+        // so `redactSecurityCodes` has to be applied here too.
+        if redactSecurityCodes {
+          text = SecurityCodeRedactor.redact(text)
+        }
         results.append(
           ScheduledMessage(
             rowID: try int64Value(row, "message_id") ?? 0,

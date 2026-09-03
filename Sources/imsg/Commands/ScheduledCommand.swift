@@ -53,10 +53,9 @@ enum ScheduledCommand {
     } else {
       limit = 50
     }
-    var messages = try storeFactory(dbPath).scheduledMessages(limit: limit)
-    if runtime.redactCodes {
-      messages = messages.map { $0.redactingSecurityCodes() }
-    }
+    let messages = try storeFactory(dbPath)
+      .configured(for: runtime)
+      .scheduledMessages(limit: limit)
     if runtime.jsonOutput {
       for message in messages {
         try JSONLines.print(ScheduledMessagePayload(message))

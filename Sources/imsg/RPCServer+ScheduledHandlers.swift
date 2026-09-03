@@ -18,10 +18,7 @@ extension RPCServer {
     let store = try await databaseResources.require().store
 
     do {
-      var messages = try store.scheduledMessages(limit: limit)
-      if redactCodes {
-        messages = messages.map { $0.redactingSecurityCodes() }
-      }
+      let messages = try store.scheduledMessages(limit: limit)
       let payloads = try messages.map { message -> [String: Any] in
         let encoded = try JSONEncoder().encode(ScheduledMessagePayload(message))
         guard let payload = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]

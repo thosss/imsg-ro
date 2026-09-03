@@ -106,7 +106,7 @@ enum WatchCommand {
       endISO: values.option("end")
     )
 
-    let store = try storeFactory(dbPath)
+    let store = try storeFactory(dbPath).configured(for: runtime)
     let watcher = MessageWatcher(store: store)
     let contacts = await contactResolverFactory()
     let config = MessageWatcherConfiguration(
@@ -116,12 +116,7 @@ enum WatchCommand {
     )
 
     let stream = streamProvider(watcher, chatID, sinceRowID, config, filter)
-    let redactCodes = runtime.redactCodes
-    let emitMessage: @Sendable (Message) throws -> Void = { rawMessage in
-      // Single choke point for every watch emission — JSON payload, plain
-      // line, and reaction line all read from `message` below, so redacting
-      // here cannot be bypassed by one of the output shapes.
-      let message = redactCodes ? rawMessage.redactingSecurityCodes() : rawMessage
+    let emitMessage: @Sendable (Message) throws -> Void = { message in
       if runtime.jsonOutput {
         let payload = try buildMessagePayload(
           store: store,

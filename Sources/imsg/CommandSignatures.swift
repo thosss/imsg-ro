@@ -45,13 +45,28 @@ enum CommandSignatures {
     )
   }
 
-  static func withRuntimeFlags(_ signature: CommandSignature) -> CommandSignature {
-    let base = signature.withStandardRuntimeFlags()
-    return CommandSignature(
-      arguments: base.arguments,
-      options: base.options,
-      flags: base.flags + [readOnlyFlag(), redactCodesFlag()],
-      optionGroups: base.optionGroups
+  /// Appends the fork's two global safety flags to a signature.
+  ///
+  /// The single place they are registered, so a command that opts out of the
+  /// standard runtime flags (`--json`, `--verbose`) still picks these up —
+  /// `completions` is the one such command, and hand-registering them there
+  /// meant any third global flag would have missed it.
+  ///
+  /// The signature is rebuilt rather than mutated because Commander declares
+  /// `CommandSignature.flags` as `public private(set)` and offers no generic
+  /// appending builder. Keep the field list exhaustive: a stored property
+  /// added to `CommandSignature` upstream and not copied here is dropped
+  /// silently.
+  static func withGlobalSafetyFlags(_ signature: CommandSignature) -> CommandSignature {
+    CommandSignature(
+      arguments: signature.arguments,
+      options: signature.options,
+      flags: signature.flags + [readOnlyFlag(), redactCodesFlag()],
+      optionGroups: signature.optionGroups
     )
+  }
+
+  static func withRuntimeFlags(_ signature: CommandSignature) -> CommandSignature {
+    withGlobalSafetyFlags(signature.withStandardRuntimeFlags())
   }
 }

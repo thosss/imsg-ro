@@ -127,18 +127,41 @@ extension RPCServer {
     respond(id: id, result: try await statusSnapshot())
   }
 
+  /// The result shared by `initialize` and `status`.
+  ///
+  /// Both method lists are filtered to what the gate would actually accept, and
+  /// `read_only` states the mode outright. This is the same reasoning
+  /// `StatusCommand.advertisedRPCMethods` applies to the CLI's `rpc_methods`:
+  /// these lists are what a capability-aware client dispatches against, so
+  /// advertising a mutating method the gate will refuse hands it a menu of
+  /// calls that cannot succeed. It matters more here than on the CLI, because
+  /// the stdio surface is the one an agent negotiates against at `initialize`,
+  /// and without `read_only` it can only discover the mode by trial.
+  ///
+  /// `redact_codes` is reported for a different reason: read-only announces
+  /// itself the moment a call is refused, but redaction silently changes the
+  /// content of successful results. A client caching or forwarding message
+  /// text has no other way to learn that it was modified.
   func statusSnapshot() async throws -> [String: Any] {
     async let database = databaseResources.snapshot()
     async let bridge = bridgeSnapshot()
     let (databaseSnapshot, bridgeSnapshot) = try await (database, bridge)
+    var methods = rpcUsableMethods(database: databaseSnapshot, bridge: bridgeSnapshot)
+    var supported = kSupportedRPCMethods
+    if readOnly {
+      methods = methods.filter { kReadOnlyRPCMethods.contains($0) }
+      supported = supported.filter { kReadOnlyRPCMethods.contains($0) }
+    }
     return [
       "version": IMsgVersion.current,
       "protocol_version": kRPCProtocolVersion,
       "database": databaseSnapshot.dictionary,
       "bridge": bridgeSnapshot.dictionary,
       "contacts": ["available": !contactResolver.contactsUnavailable],
-      "methods": rpcUsableMethods(database: databaseSnapshot, bridge: bridgeSnapshot),
-      "supported_methods": kSupportedRPCMethods,
+      "methods": methods,
+      "supported_methods": supported,
+      "read_only": readOnly,
+      "redact_codes": redactCodes,
     ]
   }
 

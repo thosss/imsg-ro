@@ -54,8 +54,7 @@ extension RPCServer {
     let reactionsByMessageID = try store.reactions(for: page.messages)
     var payloads: [[String: Any]] = []
     payloads.reserveCapacity(page.messages.count)
-    for rawMessage in page.messages {
-      let message = redactCodes ? rawMessage.redactingSecurityCodes() : rawMessage
+    for message in page.messages {
       payloads.append(
         try buildMessagePayload(
           store: store,

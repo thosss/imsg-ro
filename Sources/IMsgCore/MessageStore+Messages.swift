@@ -391,6 +391,15 @@ extension MessageStore {
     if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
       resolvedText = transcription
     }
+    // The single point where a row's message text becomes a Swift value, so
+    // this is where `redactSecurityCodes` applies. Every `Message` the store
+    // builds takes its text from here, as do reply-parent previews
+    // (`resolveReplyParent`) and poll captions (`pollCommentText`) — one seam
+    // instead of one per read path. Redaction runs after the attributedBody
+    // and audio-transcription fallbacks so it sees the text a caller would.
+    if redactSecurityCodes {
+      resolvedText = SecurityCodeRedactor.redact(resolvedText)
+    }
 
     var resolvedSender = sender
     if resolvedSender.isEmpty && !destinationCallerID.isEmpty {

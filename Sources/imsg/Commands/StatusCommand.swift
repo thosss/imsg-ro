@@ -91,7 +91,8 @@ enum StatusCommand {
         v2Ready: v2Ready,
         selectors: selectors,
         rpcMethods: advertisedRPCMethods(selectors: selectors, readOnly: runtime.readOnly),
-        readOnly: runtime.readOnly
+        readOnly: runtime.readOnly,
+        redactCodes: runtime.redactCodes
       )
       try JSONLines.print(payload)
     } else {
@@ -101,9 +102,14 @@ enum StatusCommand {
       StdoutWriter.writeLine("Version:")
       StdoutWriter.writeLine("  \(IMsgVersion.current)")
       StdoutWriter.writeLine("")
-      if runtime.readOnly {
+      if runtime.readOnly || runtime.redactCodes {
         StdoutWriter.writeLine("Mode:")
-        StdoutWriter.writeLine("  read-only (writes and mutations are disabled)")
+        if runtime.readOnly {
+          StdoutWriter.writeLine("  read-only (writes and mutations are disabled)")
+        }
+        if runtime.redactCodes {
+          StdoutWriter.writeLine("  redact-codes (security codes removed from message text)")
+        }
         StdoutWriter.writeLine("")
       }
       StdoutWriter.writeLine("Basic features (send, receive, history):")
@@ -181,6 +187,7 @@ private struct StatusPayload: Encodable {
   let selectors: [String: Bool]
   let rpcMethods: [String]
   let readOnly: Bool
+  let redactCodes: Bool
 
   enum CodingKeys: String, CodingKey {
     case version
@@ -195,5 +202,6 @@ private struct StatusPayload: Encodable {
     case selectors
     case rpcMethods = "rpc_methods"
     case readOnly = "read_only"
+    case redactCodes = "redact_codes"
   }
 }

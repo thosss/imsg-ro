@@ -53,6 +53,18 @@ struct CommandSpec: @unchecked Sendable {
     )
   }
 
+  /// Whether every invocation of this command mutates state, judged without
+  /// arguments to parse.
+  ///
+  /// For advertising a command list in read-only mode: a `.conditional`
+  /// command stays listed because some of its invocations are permitted (e.g.
+  /// `name-photo status`), while a `.write` command is dropped, since nothing
+  /// it can be asked to do would be allowed.
+  var isAlwaysMutating: Bool {
+    if case .write = mutation { return true }
+    return false
+  }
+
   /// Whether this specific invocation would mutate state, honouring
   /// `.conditional` policies that depend on the parsed arguments.
   func isMutating(for values: ParsedValues) -> Bool {

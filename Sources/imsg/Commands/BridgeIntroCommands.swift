@@ -50,11 +50,8 @@ enum SearchCommand {
     }
     let dbPath = values.option("db") ?? MessageStore.defaultPath
     let limit = values.optionInt("limit") ?? 50
-    let store = try MessageStore(path: dbPath)
-    var messages = try store.searchMessages(query: q, match: match, limit: limit)
-    if runtime.redactCodes {
-      messages = messages.map { $0.redactingSecurityCodes() }
-    }
+    let store = try MessageStore(path: dbPath).configured(for: runtime)
+    let messages = try store.searchMessages(query: q, match: match, limit: limit)
     let contacts = await contactResolverFactory()
 
     if runtime.jsonOutput {

@@ -211,6 +211,82 @@ func rpcMessagesAfterLeavesTextAloneWithoutRedactCodes() async throws {
   #expect(messages.first?["text"] as? String == "483920 is your verification code.")
 }
 
+// MARK: - The store seam
+//
+// Redaction lives on `MessageStore.redactSecurityCodes` and is applied where
+// rows are decoded, so a read path inherits it without any code of its own.
+// These tests pin that property directly: they call the store, not a handler,
+// so they would fail if redaction ever moved back out to the call sites.
+
+@Test
+func configuredStoreRedactsWithoutAnyCallerParticipation() throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  store.redactSecurityCodes = true
+
+  // No handler, no command, no `.map { $0.redacting... }` — just the store.
+  let messages = try store.messages(chatID: 1, limit: 5)
+  #expect(messages.first?.text == "[redacted] is your verification code.")
+}
+
+@Test
+func unconfiguredStoreLeavesTextAlone() throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  #expect(store.redactSecurityCodes == false)
+  let messages = try store.messages(chatID: 1, limit: 5)
+  #expect(messages.first?.text == "483920 is your verification code.")
+}
+
+@Test
+func configuredStoreRedactsEveryMessageReadPath() throws {
+  // The point of the seam: one setting covers paths that never mention
+  // redaction, including ones added after --redact-codes was written.
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  store.redactSecurityCodes = true
+  let expected = "[redacted] is your verification code."
+
+  #expect(try store.messages(chatID: 1, limit: 5).first?.text == expected)
+  #expect(try store.messages(chatID: 1, limit: 5, filter: nil).first?.text == expected)
+  #expect(try store.messagesAfter(afterRowID: 0, chatID: nil, limit: 5).first?.text == expected)
+  #expect(
+    try store.messagesAfterPage(afterRowID: 0, chatID: nil, limit: 5).messages.first?.text
+      == expected)
+  #expect(
+    try store.searchMessages(query: "verification", match: "contains", limit: 5).first?.text
+      == expected)
+
+  // The watch paths (CLI and RPC) no longer redact for themselves — they poll
+  // through MessageWatcher, whose only read is this batch method.
+  var dedupe = URLBalloonDedupeState()
+  let batch = try store.messagesAfterBatch(
+    afterRowID: 0, chatID: nil, limit: 5, includeReactions: false, dedupeState: &dedupe)
+  #expect(batch.messages.first?.text == expected)
+}
+
+@Test
+func configuredStoreIsWhatRPCServerSetsUp() throws {
+  // RPCServer configures the store it is handed, rather than each handler
+  // redacting its own results.
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  _ = RPCServer(store: store, verbose: false, redactCodes: true, output: TestRPCOutput())
+  #expect(store.redactSecurityCodes == true)
+
+  let plainStore = try makeStoreWithMessageText("483920 is your verification code.")
+  _ = RPCServer(store: plainStore, verbose: false, redactCodes: false, output: TestRPCOutput())
+  #expect(plainStore.redactSecurityCodes == false)
+}
+
+@Test
+func configuredForRuntimeAppliesTheFlag() throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  let redacting = RuntimeOptions(
+    parsedValues: ParsedValues(
+      positional: [], options: [:], flags: [CommandSignatures.redactCodesFlagLabel]))
+  #expect(store.configured(for: redacting).redactSecurityCodes == true)
+
+  let plain = RuntimeOptions(parsedValues: ParsedValues(positional: [], options: [:], flags: []))
+  #expect(store.configured(for: plain).redactSecurityCodes == false)
+}
+
 // MARK: - RuntimeOptions
 
 @Test

@@ -23,10 +23,7 @@ extension RPCServer {
     }
 
     let database = try await databaseResources.require()
-    var messages = try database.store.searchMessages(query: query, match: match, limit: limit)
-    if redactCodes {
-      messages = messages.map { $0.redactingSecurityCodes() }
-    }
+    let messages = try database.store.searchMessages(query: query, match: match, limit: limit)
     let payloads = try messages.map {
       try buildMessagePayload(
         store: database.store,

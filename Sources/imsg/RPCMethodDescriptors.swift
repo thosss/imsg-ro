@@ -222,6 +222,17 @@ private let rpcMethodByName: [String: RPCMethodDescriptor] = {
   return result
 }()
 
+/// Whether `method` names a descriptor that is compiled into this build.
+///
+/// Lets a caller tell "no such method here" from "this method exists and is
+/// refused". The read-only gate needs the distinction: an unknown name, or a
+/// `.read` method that `macOSOnly` compiled out of this build, is absent
+/// rather than blocked, and reporting it as a blocked mutation would misinform
+/// a client probing for capabilities.
+func rpcMethodIsDispatchable(_ method: String) -> Bool {
+  rpcMethodByName[method]?.isCompiledForCurrentPlatform == true
+}
+
 func rpcRequestLane(for method: String) -> RPCRequestLane {
   guard let descriptor = rpcMethodByName[method], descriptor.isCompiledForCurrentPlatform else {
     return .control

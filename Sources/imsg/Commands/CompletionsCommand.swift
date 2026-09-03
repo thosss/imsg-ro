@@ -7,11 +7,15 @@ enum CompletionsCommand {
     name: "completions",
     abstract: "Generate shell completions or LLM context",
     discussion: "Outputs completion scripts for bash, zsh, fish, or a Markdown CLI reference.",
-    signature: CommandSignature(
-      arguments: [
-        .make(label: "shell", help: "bash, zsh, fish, or llm", isOptional: true)
-      ],
-      flags: [CommandSignatures.readOnlyFlag(), CommandSignatures.redactCodesFlag()]
+    // Deliberately not `withRuntimeFlags`: completions takes no --json or
+    // --verbose. The global safety flags still apply, so they come from the
+    // shared helper rather than being listed here.
+    signature: CommandSignatures.withGlobalSafetyFlags(
+      CommandSignature(
+        arguments: [
+          .make(label: "shell", help: "bash, zsh, fish, or llm", isOptional: true)
+        ]
+      )
     ),
     usageExamples: [
       "imsg completions bash > ~/.bash_completion.d/imsg",
@@ -20,12 +24,26 @@ enum CompletionsCommand {
       "imsg completions llm",
     ],
     mutation: .read
-  ) { values, _ in
-    try await run(shell: values.argument(0), specs: CommandRouter().specs)
+  ) { values, runtime in
+    try await run(
+      shell: values.argument(0),
+      specs: CommandRouter().specs,
+      readOnly: runtime.readOnly
+    )
   }
 
-  static func run(shell: String?, specs: [CommandSpec]) async throws {
-    let output = try CompletionGenerator.generate(shell: shell, rootName: "imsg", specs: specs)
+  /// In read-only mode the generated reference lists only the commands that
+  /// would actually run.
+  ///
+  /// `completions llm` is the capability manifest an AI agent reads to learn
+  /// what it may do, so listing `send` or `delete-message` there invites calls
+  /// the router will refuse with exit code 3 — the same reasoning behind
+  /// filtering `rpc_methods`, applied to the surface an agent reads first. The
+  /// shell completions are filtered too: proposing a command that cannot run
+  /// is noise at the prompt.
+  static func run(shell: String?, specs: [CommandSpec], readOnly: Bool = false) async throws {
+    let advertised = readOnly ? specs.filter { !$0.isAlwaysMutating } : specs
+    let output = try CompletionGenerator.generate(shell: shell, rootName: "imsg", specs: advertised)
     StdoutWriter.writeLine(output)
   }
 }

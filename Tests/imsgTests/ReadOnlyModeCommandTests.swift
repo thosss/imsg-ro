@@ -82,6 +82,16 @@ func writeCommandsReportMutating() {
   #expect(ReadCommand.spec.isMutating(for: anyValues) == true)
   #expect(TypingCommand.spec.isMutating(for: anyValues) == true)
   #expect(ChatMarkCommand.spec.isMutating(for: anyValues) == true)
+  // `launch` kills Messages.app and relaunches it with DYLD_INSERT_LIBRARIES;
+  // with `--dylib` the injected code is caller-supplied and can send, so it is
+  // a write no matter which arguments it is given.
+  #expect(LaunchCommand.spec.isMutating(for: anyValues) == true)
+  #expect(
+    LaunchCommand.spec.isMutating(
+      for: ParsedValues(positional: [], options: [:], flags: ["killOnly"])) == true)
+  #expect(
+    LaunchCommand.spec.isMutating(
+      for: ParsedValues(positional: [], options: ["dylib": ["/tmp/x.dylib"]], flags: [])) == true)
 }
 
 @Test
@@ -94,7 +104,7 @@ func readCommandsReportNonMutating() {
   #expect(SearchCommand.spec.isMutating(for: anyValues) == false)
   #expect(StatusCommand.spec.isMutating(for: anyValues) == false)
   #expect(RpcCommand.spec.isMutating(for: anyValues) == false)
-  #expect(LaunchCommand.spec.isMutating(for: anyValues) == false)
+  #expect(CompletionsCommand.spec.isMutating(for: anyValues) == false)
 }
 
 @Test
@@ -131,6 +141,62 @@ func routerBlocksWriteCommandWithTrailingReadOnlyFlag() async {
     await router.run(argv: ["imsg", "send", "--to", "+15551234567", "--text", "hi", "--read-only"])
   }
   #expect(status == CommandRouter.readOnlyExitCode)
+}
+
+@Test
+func routerBlocksLaunchInReadOnlyMode() async {
+  // Both forms: --kill-only terminates Messages.app, and --dylib injects
+  // caller-supplied code into it, which can then send.
+  for argv in [
+    ["imsg", "--read-only", "launch"],
+    ["imsg", "--read-only", "launch", "--kill-only"],
+    ["imsg", "--read-only", "launch", "--dylib", "/tmp/attacker.dylib"],
+  ] {
+    let router = CommandRouter()
+    let (output, status) = await StdoutCapture.capture {
+      await router.run(argv: argv)
+    }
+    #expect(status == CommandRouter.readOnlyExitCode, "\(argv) should be refused")
+    #expect(output.contains("'launch'"))
+  }
+}
+
+// MARK: - Advertised capabilities
+
+@Test
+func completionsOmitWriteCommandsInReadOnlyMode() async throws {
+  // `completions llm` is the manifest an agent reads to learn what it may do,
+  // so it must not offer calls the router will refuse with exit code 3.
+  let specs = CommandRouter().specs
+  let (readOnlyOutput, _) = await StdoutCapture.capture {
+    try? await CompletionsCommand.run(shell: "llm", specs: specs, readOnly: true)
+  }
+  let (fullOutput, _) = await StdoutCapture.capture {
+    try? await CompletionsCommand.run(shell: "llm", specs: specs, readOnly: false)
+  }
+
+  for command in ["send", "delete-message", "chat-delete", "chat-leave", "launch"] {
+    #expect(fullOutput.contains("### \(command)\n"), "\(command) should be listed by default")
+    #expect(
+      !readOnlyOutput.contains("### \(command)\n"),
+      "\(command) mutates and should not be advertised in read-only mode")
+  }
+  // Reads stay listed, and a conditionally-mutating command keeps its entry
+  // because some of its invocations are permitted.
+  for command in ["chats", "history", "search", "status", "name-photo"] {
+    #expect(
+      readOnlyOutput.contains("### \(command)\n"),
+      "\(command) is usable read-only and should stay advertised")
+  }
+}
+
+@Test
+func completionsAdvertiseEverythingByDefault() {
+  let specs = CommandRouter().specs
+  #expect(specs.contains { $0.name == "send" && $0.isAlwaysMutating })
+  #expect(specs.contains { $0.name == "chats" && !$0.isAlwaysMutating })
+  // `.conditional` is not "always" mutating: name-photo status is a read.
+  #expect(specs.contains { $0.name == "name-photo" && !$0.isAlwaysMutating })
 }
 
 @Test

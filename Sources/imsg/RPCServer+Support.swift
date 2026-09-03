@@ -1,12 +1,37 @@
 import Foundation
 import IMsgCore
 
+/// Every JSON-RPC error code this server emits, in one place.
+///
+/// The point of the enum is that Swift rejects duplicate raw values at compile
+/// time. A future error condition that tries to claim an already-used code —
+/// `readOnly`'s -32005 above all — fails the build instead of silently
+/// colliding, which is what happened once already: read-only originally used
+/// -32001, and an upstream merge later assigned that code to `deliveryFailure`.
+/// Add a case here before writing a new `RPCError` constructor, and never
+/// hardcode a numeric code at a construction site.
+enum RPCErrorCode: Int, CaseIterable, Sendable {
+  // JSON-RPC 2.0 reserved range.
+  case parseError = -32700
+  case invalidRequest = -32600
+  case methodNotFound = -32601
+  case invalidParams = -32602
+  case internalError = -32603
+  // Implementation-defined server-error range (-32000…-32099).
+  case serverBusy = -32000
+  case deliveryUnknown = -32001
+  case databaseUnavailable = -32002
+  case bridgeUnavailable = -32003
+  case mutationLaneBlocked = -32004
+  case readOnly = -32005
+}
+
 /// JSON-RPC error code for a read-only mode refusal.
 ///
 /// Must stay distinct from every other code this server emits — see
 /// `RPCError.readOnly` for why, and `rpcReadOnlyErrorCodeDoesNotCollide` for
 /// the test that enforces it.
-let kReadOnlyRPCErrorCode = -32005
+let kReadOnlyRPCErrorCode = RPCErrorCode.readOnly.rawValue
 
 final class RPCWriter: RPCOutput, Sendable {
   func sendResponse(id: Any, result: Any) {
@@ -50,38 +75,40 @@ struct RPCError: Error, @unchecked Sendable {
   let data: String?
   let structuredData: [String: Any]?
 
-  init(code: Int, message: String, data: String?) {
-    self.code = code
+  /// Codes come from `RPCErrorCode` rather than integer literals so that the
+  /// enum stays the single source of truth for what each number means.
+  init(code: RPCErrorCode, message: String, data: String?) {
+    self.code = code.rawValue
     self.message = message
     self.data = data
     self.structuredData = nil
   }
 
-  private init(code: Int, message: String, structuredData: [String: Any]) {
-    self.code = code
+  private init(code: RPCErrorCode, message: String, structuredData: [String: Any]) {
+    self.code = code.rawValue
     self.message = message
     self.data = nil
     self.structuredData = structuredData
   }
 
   static func parseError(_ message: String) -> RPCError {
-    RPCError(code: -32700, message: "Parse error", data: message)
+    RPCError(code: .parseError, message: "Parse error", data: message)
   }
 
   static func invalidRequest(_ message: String) -> RPCError {
-    RPCError(code: -32600, message: "Invalid Request", data: message)
+    RPCError(code: .invalidRequest, message: "Invalid Request", data: message)
   }
 
   static func methodNotFound(_ method: String) -> RPCError {
-    RPCError(code: -32601, message: "Method not found", data: method)
+    RPCError(code: .methodNotFound, message: "Method not found", data: method)
   }
 
   static func invalidParams(_ message: String) -> RPCError {
-    RPCError(code: -32602, message: "Invalid params", data: message)
+    RPCError(code: .invalidParams, message: "Invalid params", data: message)
   }
 
   static func internalError(_ message: String) -> RPCError {
-    RPCError(code: -32603, message: "Internal error", data: message)
+    RPCError(code: .internalError, message: "Internal error", data: message)
   }
 
   /// Returned when a mutating method is invoked while the server runs in
@@ -96,19 +123,19 @@ struct RPCError: Error, @unchecked Sendable {
   /// by code alone — opposite meanings for a caller deciding whether to retry.
   static func readOnly(_ method: String) -> RPCError {
     RPCError(
-      code: kReadOnlyRPCErrorCode,
+      code: .readOnly,
       message: "Read-only mode: mutating method disabled",
       data: method
     )
   }
 
   static func serverBusy(_ message: String) -> RPCError {
-    RPCError(code: -32000, message: "Server busy", data: message)
+    RPCError(code: .serverBusy, message: "Server busy", data: message)
   }
 
   static func databaseUnavailable(path: String, detail: String) -> RPCError {
     RPCError(
-      code: -32002,
+      code: .databaseUnavailable,
       message: "Database unavailable",
       structuredData: ["path": path, "detail": detail, "retryable": true]
     )
@@ -116,7 +143,7 @@ struct RPCError: Error, @unchecked Sendable {
 
   static func bridgeUnavailable() -> RPCError {
     RPCError(
-      code: -32003,
+      code: .bridgeUnavailable,
       message: "Bridge unavailable",
       structuredData: [
         "detail":
@@ -128,7 +155,7 @@ struct RPCError: Error, @unchecked Sendable {
 
   static func bridgeEventsUnavailable(detail: String) -> RPCError {
     RPCError(
-      code: -32003,
+      code: .bridgeUnavailable,
       message: "Bridge events unavailable",
       structuredData: ["detail": detail, "retryable": true]
     )
@@ -137,7 +164,7 @@ struct RPCError: Error, @unchecked Sendable {
   static func deliveryFailure(_ failure: DeliveryFailure) -> RPCError {
     let unknown = failure.disposition != .notStarted
     return RPCError(
-      code: unknown ? -32001 : -32603,
+      code: unknown ? .deliveryUnknown : .internalError,
       message: unknown ? "Delivery outcome unknown" : "Delivery failed before dispatch",
       structuredData: deliveryData(failure)
     )
@@ -147,7 +174,8 @@ struct RPCError: Error, @unchecked Sendable {
     var data = deliveryData(failure)
     data["detail"] =
       "A prior \(failure.operation) remains in flight. Restart the RPC child before sending another mutation."
-    return RPCError(code: -32004, message: "Mutation lane blocked", structuredData: data)
+    return RPCError(
+      code: .mutationLaneBlocked, message: "Mutation lane blocked", structuredData: data)
   }
 
   private static func deliveryData(_ failure: DeliveryFailure) -> [String: Any] {

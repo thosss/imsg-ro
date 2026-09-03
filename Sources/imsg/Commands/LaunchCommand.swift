@@ -34,7 +34,14 @@ enum LaunchCommand {
       "imsg launch --dylib /path/to/dylib",
       "imsg launch --json",
     ],
-    mutation: .read
+    // Not a read: `launch` terminates the user's Messages.app and relaunches it
+    // with DYLD_INSERT_LIBRARIES. `--dylib` makes the injected code caller-
+    // supplied, so permitting this in read-only mode would let a caller run
+    // arbitrary code inside Messages — which can then send, defeating the gate
+    // it just passed. `--kill-only` still terminates the app. Launching the
+    // bridge is a setup step the user performs, not one a read-only caller
+    // needs.
+    mutation: .write
   ) { values, runtime in
     try await run(values: values, runtime: runtime)
   }

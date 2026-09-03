@@ -90,12 +90,7 @@ extension RPCServer {
       startISO: startISO,
       endISO: endISO
     )
-    // `max(limit, 1)` is gone: upstream now rejects a non-positive limit with
-    // invalidParams above, so clamping here would only mask a bad request.
-    var filtered = try store.messages(chatID: chatID, limit: limit, filter: filter)
-    if redactCodes {
-      filtered = filtered.map { $0.redactingSecurityCodes() }
-    }
+    let filtered = try store.messages(chatID: chatID, limit: limit, filter: filter)
     let reactionsByMessageID = try store.reactions(for: filtered)
 
     var payloads: [[String: Any]] = []

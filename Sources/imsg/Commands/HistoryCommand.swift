@@ -62,11 +62,8 @@ enum HistoryCommand {
       endISO: values.option("end")
     )
 
-    let store = try MessageStore(path: dbPath)
-    var filtered = try store.messages(chatID: chatID, limit: limit, filter: filter)
-    if runtime.redactCodes {
-      filtered = filtered.map { $0.redactingSecurityCodes() }
-    }
+    let store = try MessageStore(path: dbPath).configured(for: runtime)
+    let filtered = try store.messages(chatID: chatID, limit: limit, filter: filter)
     let contacts = await contactResolverFactory()
 
     if runtime.jsonOutput {

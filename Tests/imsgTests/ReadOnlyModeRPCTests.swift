@@ -80,6 +80,10 @@ func rpcReadOnlyRejectsUnknownMethodRatherThanFailingOpen() async throws {
   // keyed on known mutating methods, so it stays fail-closed even for a
   // method that was never registered at all (e.g. a future handler added to
   // the dispatch switch but forgotten in kSupportedRPCMethods).
+  //
+  // Fail-closed is about what runs, not about which code comes back: the call
+  // is refused before dispatch either way, and an unregistered name is
+  // reported as method-not-found because that is what it is.
   let store = try CommandTestDatabase.makeStoreForRPC()
   let output = TestRPCOutput()
   let server = RPCServer(store: store, verbose: false, readOnly: true, output: output)
@@ -87,8 +91,80 @@ func rpcReadOnlyRejectsUnknownMethodRatherThanFailingOpen() async throws {
   let line = #"{"jsonrpc":"2.0","id":"1","method":"totally.unregistered","params":{}}"#
   await server.handleLineForTesting(line)
 
+  #expect(output.responses.isEmpty)
   let error = output.errors.first?["error"] as? [String: Any]
-  #expect(int64(error?["code"]) == Int64(kReadOnlyRPCErrorCode))
+  #expect(int64(error?["code"]) == Int64(RPCErrorCode.methodNotFound.rawValue))
+}
+
+@Test
+func rpcReadOnlyReportsMutationsAndAbsentMethodsDifferently() async throws {
+  // A refusal a client can act on: -32005 means "this exists and this server
+  // will not do it", -32601 means "no such method here". Conflating them
+  // mislabels a read method that `macOSOnly` compiled out of the build as a
+  // blocked mutation.
+  let store = try CommandTestDatabase.makeStoreForRPC()
+
+  for method in ["send", "tapback", "chats.delete"] {
+    let output = TestRPCOutput()
+    let server = RPCServer(store: store, verbose: false, readOnly: true, output: output)
+    await server.handleLineForTesting(
+      #"{"jsonrpc":"2.0","id":"1","method":"\#(method)","params":{}}"#)
+    let error = output.errors.first?["error"] as? [String: Any]
+    #expect(
+      int64(error?["code"]) == Int64(kReadOnlyRPCErrorCode),
+      "\(method) is a compiled-in mutation and should read as read-only refused")
+  }
+
+  for method in ["totally.unregistered", "send.definitely_not_a_method"] {
+    let output = TestRPCOutput()
+    let server = RPCServer(store: store, verbose: false, readOnly: true, output: output)
+    await server.handleLineForTesting(
+      #"{"jsonrpc":"2.0","id":"1","method":"\#(method)","params":{}}"#)
+    let error = output.errors.first?["error"] as? [String: Any]
+    #expect(
+      int64(error?["code"]) == Int64(RPCErrorCode.methodNotFound.rawValue),
+      "\(method) does not exist and should read as method-not-found")
+  }
+
+  // Whichever code comes back, the gate refused before dispatch.
+  #expect(rpcMethodIsDispatchable("send") == kSupportedRPCMethods.contains("send"))
+  #expect(rpcMethodIsDispatchable("totally.unregistered") == false)
+}
+
+@Test
+func rpcReadOnlyStatusAdvertisesOnlyPermittedMethods() async throws {
+  // status/initialize is what a stdio client negotiates against, so the lists
+  // it returns must not offer calls the gate will refuse, and read_only has to
+  // be discoverable without probing.
+  let store = try CommandTestDatabase.makeStoreForRPC()
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, readOnly: true, output: output)
+
+  await server.handleLineForTesting(#"{"jsonrpc":"2.0","id":"1","method":"status","params":{}}"#)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(result?["read_only"] as? Bool == true)
+
+  let supported = result?["supported_methods"] as? [String] ?? []
+  #expect(!supported.isEmpty)
+  #expect(!supported.contains("send"))
+  #expect(supported.allSatisfy { kReadOnlyRPCMethods.contains($0) })
+
+  let methods = result?["methods"] as? [String] ?? []
+  #expect(methods.allSatisfy { kReadOnlyRPCMethods.contains($0) })
+}
+
+@Test
+func rpcReadWriteStatusStillAdvertisesEverything() async throws {
+  let store = try CommandTestDatabase.makeStoreForRPC()
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, readOnly: false, output: output)
+
+  await server.handleLineForTesting(#"{"jsonrpc":"2.0","id":"1","method":"status","params":{}}"#)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(result?["read_only"] as? Bool == false)
+  #expect((result?["supported_methods"] as? [String]) == kSupportedRPCMethods)
 }
 
 @Test
@@ -110,7 +186,19 @@ func rpcReadOnlyErrorCodeDoesNotCollide() {
   //
   // This is a real regression: read-only originally used -32001, and an
   // upstream merge later assigned that same code to deliveryFailure.
-  let others: [RPCError] = [
+  //
+  // Uniqueness itself is enforced by the compiler, not by this test: RPCErrorCode
+  // is a raw-value enum, so a future case claiming -32005 fails the build. What
+  // is checked here is that the constructors go through that enum — a numeric
+  // literal at a construction site would escape the compiler's check, and this
+  // fork's tests run neither locally nor in CI, so an assertion resting on a
+  // hand-maintained list of constructors would be worth little.
+  #expect(RPCError.readOnly("send").code == RPCErrorCode.readOnly.rawValue)
+  #expect(kReadOnlyRPCErrorCode == RPCErrorCode.readOnly.rawValue)
+
+  let constructed: [RPCError] = [
+    .parseError("x"),
+    .invalidRequest("x"),
     .invalidParams("x"),
     .internalError("x"),
     .methodNotFound("x"),
@@ -125,6 +213,13 @@ func rpcReadOnlyErrorCodeDoesNotCollide() {
         operation: "send",
         detail: "x"
       )),
+    .deliveryFailure(
+      DeliveryFailure(
+        disposition: .notStarted,
+        transport: .appleScript,
+        operation: "send",
+        detail: "x"
+      )),
     .mutationLaneBlocked(
       DeliveryFailure(
         disposition: .stillInFlight,
@@ -134,10 +229,12 @@ func rpcReadOnlyErrorCodeDoesNotCollide() {
       )),
   ]
 
-  #expect(RPCError.readOnly("send").code == kReadOnlyRPCErrorCode)
-  for other in others {
+  for error in constructed {
     #expect(
-      other.code != kReadOnlyRPCErrorCode,
-      "\(other.message) reuses the read-only code \(kReadOnlyRPCErrorCode)")
+      RPCErrorCode(rawValue: error.code) != nil,
+      "\(error.message) carries code \(error.code), which is not a declared RPCErrorCode")
+    #expect(
+      error.code != kReadOnlyRPCErrorCode,
+      "\(error.message) reuses the read-only code \(kReadOnlyRPCErrorCode)")
   }
 }

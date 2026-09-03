@@ -45,40 +45,6 @@ typealias RPCBridgeEventStreamProvider = (
   _ bufferLimit: Int
 ) throws -> AsyncThrowingStream<IMsgEventTailer.Event, Error>
 
-/// RPC methods permitted while the server runs in read-only mode
-/// (`imsg rpc --read-only`). Derived from each method's declared
-/// `RPCMethodDescriptor.lane` rather than a hand-maintained name list.
-///
-/// Fail-closed by construction, in two ways:
-///
-/// 1. Only a method with a registered descriptor can appear here, so an
-///    unrecognized method name is refused rather than falling through to the
-///    dispatch switch.
-/// 2. `RPCMethodDescriptor` requires an explicit `lane:` at every declaration
-///    site — there is no default — so a newly added mutating method is denied
-///    the moment it is written, without anyone remembering to update a
-///    separate allow-list.
-///
-/// `.read` and `.control` are both permitted: `.control` covers `initialize`,
-/// `watch.subscribe`/`unsubscribe`, and `bridge.events.subscribe`, which
-/// manage this process's own streams and never write to Messages.
-///
-/// Platform filtering matters for the gate's safety: a macOS-only mutating
-/// method must not become permitted just because it is not compiled on Linux,
-/// so descriptors are screened by `isCompiledForCurrentPlatform` before their
-/// lane is consulted.
-let kReadOnlyRPCMethods: Set<String> = Set(
-  rpcMethodDescriptors
-    .filter { $0.isCompiledForCurrentPlatform && $0.lane != .mutation }
-    .flatMap(\.names)
-)
-
-/// RPC methods that mutate state. Not consulted by the runtime gate directly
-/// (see `kReadOnlyRPCMethods`); kept so a test can assert that every advertised
-/// method is classified as exactly one of read or mutating.
-let kMutatingRPCMethods: Set<String> = Set(kSupportedRPCMethods)
-  .subtracting(kReadOnlyRPCMethods)
-
 // MessageStore, stdout, and watcher state are serial-queue-owned; subscriptions are actors.
 // Remaining production dependencies are immutable or internally synchronized.
 final class RPCServer: @unchecked Sendable {
@@ -151,6 +117,10 @@ final class RPCServer: @unchecked Sendable {
       )
     }
   ) {
+    // Configure redaction on the store itself, so every read path this server
+    // serves — including any added later — returns redacted text without each
+    // handler having to remember. See `MessageStore.redactSecurityCodes`.
+    store.redactSecurityCodes = redactCodes
     self.databaseResources = RPCDatabaseResourceOwner(store: store)
     self.subscriptions = SubscriptionStore(limit: 64)
     self.verbose = verbose
@@ -215,7 +185,16 @@ final class RPCServer: @unchecked Sendable {
       )
     }
   ) {
-    self.databaseResources = RPCDatabaseResourceOwner(path: databasePath, factory: storeFactory)
+    // Same as the store-based init, but the store is opened lazily (and
+    // reopened when the database file is replaced), so redaction is applied by
+    // wrapping the factory rather than set once.
+    let redactingStoreFactory: RPCMessageStoreFactory = { path in
+      let store = try storeFactory(path)
+      store.redactSecurityCodes = redactCodes
+      return store
+    }
+    self.databaseResources = RPCDatabaseResourceOwner(
+      path: databasePath, factory: redactingStoreFactory)
     self.subscriptions = SubscriptionStore(limit: 64)
     self.verbose = verbose
     self.readOnly = readOnly
@@ -318,9 +297,20 @@ final class RPCServer: @unchecked Sendable {
     //
     // The refusal is evaluated before dispatch, so nothing runs. Notifications
     // get no response, per JSON-RPC — they are still refused, just silently.
+    //
+    // Which error comes back is a separate question from whether the call is
+    // refused: a name with no compiled-in descriptor is not a blocked mutation
+    // but an absent method, and answering -32601 for it keeps read-only mode
+    // reporting the same thing read-write mode would. Without that split, a
+    // Linux client asking for `handles.check` (a `.read` method compiled out
+    // by `macOSOnly`) would be told its read was refused as a mutation.
     if readOnly && !kReadOnlyRPCMethods.contains(method) {
       if !request.isNotification {
-        output.sendError(id: id, error: RPCError.readOnly(method))
+        let error =
+          rpcMethodIsDispatchable(method)
+          ? RPCError.readOnly(method)
+          : RPCError.methodNotFound(method)
+        output.sendError(id: id, error: error)
       }
       return .completed
     }

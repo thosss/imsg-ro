@@ -64,7 +64,6 @@ extension RPCServer {
     let localContactResolver = contactResolver
     let localSubscriptions = subscriptions
     let localStreamProvider = watchStreamProvider
-    let localRedactCodes = redactCodes
     let startGate = SubscriptionStartGate()
     let task = Task {
       let activated = await startGate.wait()
@@ -73,7 +72,7 @@ extension RPCServer {
         return
       }
       do {
-        for try await rawMessage in localStreamProvider(
+        for try await message in localStreamProvider(
           localWatcher,
           localChatID,
           localSinceRowID,
@@ -81,7 +80,6 @@ extension RPCServer {
           localFilter
         ) {
           try Task.checkCancellation()
-          let message = localRedactCodes ? rawMessage.redactingSecurityCodes() : rawMessage
           let payload = try buildMessagePayload(
             store: localStore,
             message: message,

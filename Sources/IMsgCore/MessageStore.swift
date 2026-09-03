@@ -11,6 +11,20 @@ public final class MessageStore: @unchecked Sendable {
 
   public let path: String
 
+  /// When true, message text read through this store has texted security /
+  /// verification codes replaced with `SecurityCodeRedactor.placeholder`.
+  ///
+  /// Applied where database rows are decoded (`decodeMessageRow`, and
+  /// `scheduledMessages` for its separate query) rather than at each render
+  /// site, so every read path inherits it — including ones added later. The
+  /// alternative, redacting in each handler and command, is fail-open: a new
+  /// read path leaks until someone remembers to patch it, which is exactly
+  /// what happened when `messages.after` arrived upstream.
+  ///
+  /// Set once immediately after construction, before the store is used; it is
+  /// not synchronized for concurrent mutation.
+  public var redactSecurityCodes = false
+
   private let connection: Connection
   private let queue: DispatchQueue
   private let queueKey = DispatchSpecificKey<Void>()
