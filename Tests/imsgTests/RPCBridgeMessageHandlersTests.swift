@@ -27,6 +27,7 @@ func rpcStatusAdvertisesBridgeMessageMethods() {
   for method in [
     "send.rich",
     "send.attachment",
+    "send.multipart",
     "send.sticker",
     "poll.send",
     "messages.poll.send",
@@ -113,8 +114,7 @@ func rpcPollVoteValidatesAndResolvesOption() async throws {
 
   let request =
     #"{"jsonrpc":"2.0","id":"vote","method":"poll.vote","params":{"chat_id":1,"#
-    + #""poll_guid":"p:0/poll-guid-6","option_id":"choice-no","option_text":"spoofed","#
-    + #""voter_handle":"spoofed"}}"#
+    + #""poll_guid":"p:0/poll-guid-6","option_id":"choice-no"}}"#
   await server.handleLineForTesting(request)
 
   #expect(capturedAction == .sendPollVote)
@@ -215,6 +215,31 @@ func rpcPollSendUsesCommentOverrideWithoutPollGuid() async throws {
   #expect(calls.first?.params["question"] as? String == "Dinner?")
   #expect(calls.last?.action == .sendMessage)
   #expect(calls.last?.params["message"] as? String == "Vote by 5pm")
+}
+
+@Test
+func rpcPollSendCanSuppressCaption() async throws {
+  let store = try CommandTestDatabase.makeStoreForRPC()
+  let output = TestRPCOutput()
+  var calls: [(action: BridgeAction, params: [String: Any])] = []
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    output: output,
+    invokeBridge: { action, params in
+      calls.append((action, params))
+      return ["messageGuid": "poll-guid"]
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"poll","method":"poll.send","params":{"#
+      + #""chat_id":1,"question":"Dinner?","options":["Pizza","Sushi"],"#
+      + #""suppress_comment":true}}"#
+  )
+
+  #expect(calls.count == 1)
+  #expect(calls.first?.action == .sendPoll)
 }
 
 @Test
@@ -385,15 +410,17 @@ func rpcSendAttachmentStagesFileBeforeBridgeSend() async throws {
 
   let line =
     #"{"jsonrpc":"2.0","id":"attachment","method":"send.attachment","params":{"#
-    + #""chat_id":1,"file":"~/Desktop/file.png","audio":true,"reply_to":"parent-guid"}}"#
+    + #""chat_id":1,"file":"~/Desktop/file.png","audio":true,"reply_to":"parent-guid","part_index":2}}"#
   await server.handleLineForTesting(line)
 
   #expect(stagedInput?.hasSuffix("/Desktop/file.png") == true)
   #expect(capturedParams["filePath"] as? String == "/tmp/staged-file.png")
   #expect(capturedParams["isAudioMessage"] as? Bool == true)
   #expect(capturedParams["selectedMessageGuid"] as? String == "parent-guid")
+  #expect(capturedParams["partIndex"] as? Int == 2)
   let result = output.responses.first?["result"] as? [String: Any]
   #expect(result?["message_id"] as? String == "attachment-guid")
+  #expect(result?["chat_guid"] as? String == "iMessage;+;chat123")
 }
 
 @Test

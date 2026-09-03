@@ -3,9 +3,9 @@ title: Permissions
 description: "Full Disk Access, Automation, Contacts — what imsg needs and why."
 ---
 
-`imsg` is local-only, but Messages.app data sits behind macOS privacy gates. Three permissions cover every feature; only the first is mandatory.
+`imsg` is local-only, but Messages.app data sits behind macOS privacy gates. Three permissions cover every feature. Full Disk Access is required for database-backed reads, but a supervised `imsg rpc` child can start in degraded mode without it.
 
-## Full Disk Access — required
+## Full Disk Access — required for database methods
 
 `imsg` reads `~/Library/Messages/chat.db` directly. macOS denies that path to every process that hasn't been added to **Full Disk Access**.
 
@@ -22,9 +22,21 @@ After changing entries, quit and relaunch the parent process. macOS only re-read
 
 `imsg` opens `chat.db` read-only. It does not pass SQLite's `immutable=1` flag because immutable handles can miss WAL-backed updates that Messages writes during normal use.
 
-## Automation — required for sends and tapbacks
+`imsg rpc` does not treat a missing grant as a process-startup failure.
+`initialize` / `status`, direct sends, `typing` / `read` requests using `to`,
+`chat_identifier`, or `chat_guid`, eligible explicit-GUID bridge-only methods,
+and watch unsubscribe remain available according to their other prerequisites.
+The same child retries the database on each status or database-backed request
+and recovers once the grant/path becomes readable. A `chat_id` target still
+requires the database.
 
-`imsg send`, `imsg react`, `imsg typing`, and `imsg read` drive Messages.app via AppleScript. macOS gates that under **Automation**.
+## Automation — required for AppleScript sends and tapbacks
+
+Direct `imsg send` and `imsg react` operations drive Messages.app via
+AppleScript. macOS gates that under **Automation**. Typing indicators and read
+receipts use the advanced IMCore paths instead; they do not use AppleScript,
+but their shipped bridge fallback/activation behavior may activate
+Messages.app.
 
 The first time you run a send, macOS prompts:
 
@@ -40,7 +52,16 @@ When granted, `imsg` resolves names from your Address Book and includes them as 
 
 Grant it under **System Settings → Privacy & Security → Contacts**.
 
-If you skip this, JSON output simply leaves the resolved name fields empty. Nothing else changes.
+`imsg nickname --local` distinguishes `(Contacts unavailable)` from `(none)` in
+text output; JSON exposes the same distinction as `contacts_unavailable`. An
+unavailable result means imsg could not read Contacts, not that the handle has no
+matching contact. For SSH and other indirect launches, check the Contacts grant
+for the app or process running imsg. Full Disk Access alone does not grant Contacts
+access.
+
+If you skip this, JSON output simply leaves the resolved name fields empty. Nothing else changes. A long-running `imsg rpc` child observes Contacts changes and periodically rechecks authorization, so grants and contact edits become visible without restarting. Revocation clears cached names; a transient Contacts read failure retains the last successful catalog until the next refresh.
+
+On Macs with CardDAV accounts such as Google or Yahoo, Apple's Contacts framework may periodically write `Could not fetch group … :ABGroup` reconciliation messages to stderr. These messages are benign and do not come from `imsg`; a parent process that captures `imsg rpc --json` stderr should not report this specific framework message as an `imsg` error.
 
 ## Why these grants live in three different places
 
@@ -49,10 +70,10 @@ macOS treats each gate as a separate consent decision:
 | Gate | What it protects | Triggered by |
 |------|------------------|--------------|
 | Full Disk Access | `~/Library/Messages/`, Mail, Safari history, … | `imsg chats`, `history`, `watch`, `group`, anything that opens `chat.db`. |
-| Automation | One app driving another via Apple Events | `imsg send`, `react`, `read`, `typing`. |
+| Automation | One app driving another via Apple Events | Direct `imsg send` and `react`. |
 | Contacts | Address Book entries | Name resolution in any read or send command. |
 
-Only Full Disk Access is mandatory. Skip Automation if you don't send. Skip Contacts if you don't need name resolution. The CLI degrades cleanly — it tells you which gate is missing instead of silently failing.
+Full Disk Access is mandatory for history, chats, watch subscriptions, send-status inspection, and other database-backed methods. Skip Automation if you don't send. Skip Contacts if you don't need name resolution. The CLI and RPC status snapshots identify the missing gate instead of silently failing.
 
 ## Stale grants after updates
 

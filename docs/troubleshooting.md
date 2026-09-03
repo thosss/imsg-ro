@@ -25,6 +25,13 @@ sqlite3 ~/Library/Messages/chat.db 'pragma quick_check;'
 
 If `sqlite3` works but `imsg` doesn't, the parent process of `imsg` is still missing the grant. If `sqlite3` also fails, fix Full Disk Access first.
 
+A supervised `imsg rpc` child does not need to be restarted after this fix.
+Send a `status` request to retry the configured path; `database.ready` changes
+to `true` when the open succeeds, and database methods appear in `methods`.
+Until then those methods return `-32002` (`Database unavailable`) while
+`initialize`, `status`, direct send, eligible explicit-GUID bridge methods, and
+`watch.unsubscribe` remain structurally available.
+
 ## Reads succeed but return zero rows
 
 Messages.app isn't signed in, or `chat.db` doesn't exist.
@@ -45,13 +52,30 @@ Automation permission is missing.
 
 If the toggle isn't visible, run a send once to trigger the prompt, then approve.
 
-## Sends look successful but never arrive
+## Sends report success but never arrive
 
-Two possible causes:
+Current versions verify every AppleScript text send against `chat.db` when the
+database is readable. If Messages returns success but no matching outgoing row
+appears within eight seconds, the CLI exits nonzero and RPC returns `-32001`
+with `may_have_completed`; do not retry automatically. Direct sends made while
+the database is unavailable retain the older best-effort acknowledgment.
 
-**Tahoe ghost-row failure (group sends).** On macOS 26, Messages.app sometimes reports AppleScript success while writing an empty unjoined SMS row instead of delivering. `imsg send` for chat-target sends already detects this and reports an error instead of `sent`. If you're still seeing silent failures with `--chat-id`/`--chat-identifier`/`--chat-guid`, make sure you're on `imsg` 0.6.0 or newer (`imsg --version`).
+Other routing failures to check:
+
+**Tahoe ghost-row failure.** On macOS 26, Messages.app sometimes reports AppleScript success while writing an empty unjoined SMS row instead of delivering. `imsg send` checks explicit chat targets and existing direct chats for this row and preserves the specific ghost-row diagnostic.
 
 **Service mismatch.** A send to a phone number with `--service imessage` fails fast if the recipient isn't on iMessage. With `--service sms`, Text Message Forwarding must be enabled on your iPhone for this Mac. With `--service auto`, `imsg` checks local history first; text-only direct phone sends may retry once over SMS unless `--no-sms-fallback` is set.
+
+**Uncertain delivery outcome.** Errors marked `may_have_completed` or
+`still_in_flight` are deliberately not retried or downgraded: the first
+transport may already have sent the message. Check Messages/history before
+taking another action. Only `not_started` is retry-safe.
+
+For JSON-RPC, `still_in_flight` also blocks queued and future mutations with
+`-32004` while reads and watch control keep working. Resolve the outstanding
+operation as best you can, then restart the supervised `imsg rpc` child to
+clear the process-local mutation-lane poison. Do not repeatedly submit the
+same send to the blocked child.
 
 ## `imsg watch` goes silent after a while
 
@@ -95,6 +119,16 @@ If you want partial fallback names (initials, or formatted handles), do that in 
 ## Advanced IMCore features fail
 
 See [Advanced IMCore features](advanced-imcore.md). Most likely SIP is enabled (required to be off), library validation is rejecting the helper dylib, or macOS 26's `imagent` entitlement check is blocking the IMCore client. These are macOS-level gates `imsg` cannot work around.
+
+RPC `initialize`, `status`, and bridge capability probes never launch or
+restart Messages.app. Bridge-only RPC methods use only an already-running
+bridge: run `imsg launch` outside the supervised child, then call RPC `status`
+again. The shipped RPC `typing` and `read` methods are exceptions. Typing keeps
+its bridge-first, delivery-safe direct-IMCore fallback, and read keeps IMCore
+bridge activation, so either may activate Messages.app. Direct AppleScript
+`send` may activate it too. If the ready lock is absent, bridge-only reads
+return `-32003`; bridge-only mutations report a retry-safe `not_started`
+delivery failure.
 
 ## Filing issues
 

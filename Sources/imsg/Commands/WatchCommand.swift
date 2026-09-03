@@ -3,6 +3,11 @@ import Foundation
 import IMsgCore
 
 enum WatchCommand {
+  /// Same TTY rule as RPC: headless stdin must not prompt for Contacts.
+  static func contactsAccessPolicy(stdinIsTTY: Bool) -> ContactsAccessPolicy {
+    .forStdin(isTTY: stdinIsTTY)
+  }
+
   static let spec = CommandSpec(
     name: "watch",
     abstract: "Stream incoming messages",
@@ -56,16 +61,29 @@ enum WatchCommand {
     runtime: RuntimeOptions,
     storeFactory: @escaping (String) throws -> MessageStore = { try MessageStore(path: $0) },
     contactResolverFactory: @escaping () async -> any ContactResolving = {
-      await ContactResolver.create()
+      await ContactResolver.create(
+        accessPolicy: contactsAccessPolicy(stdinIsTTY: ContactsAccessPolicy.stdinIsTTY)
+      )
     },
     streamProvider:
       @escaping (
         MessageWatcher,
         Int64?,
         Int64?,
-        MessageWatcherConfiguration
-      ) -> AsyncThrowingStream<Message, Error> = { watcher, chatID, sinceRowID, config in
-        watcher.stream(chatID: chatID, sinceRowID: sinceRowID, configuration: config)
+        MessageWatcherConfiguration,
+        MessageFilter
+      ) -> AsyncThrowingStream<Message, Error> = {
+        watcher, chatID, sinceRowID, config, filter in
+        watcher.stream(
+          chatID: chatID,
+          sinceRowID: sinceRowID,
+          configuration: config,
+          filter: filter
+        )
+      },
+    bridgeStreamProvider:
+      @escaping (String) throws -> AsyncThrowingStream<IMsgEventTailer.Event, Error> = { path in
+        IMsgEventTailer(path: path, createIfMissing: true).events()
       }
   ) async throws {
     let dbPath = values.option("db") ?? MessageStore.defaultPath
@@ -90,7 +108,6 @@ enum WatchCommand {
 
     let store = try storeFactory(dbPath)
     let watcher = MessageWatcher(store: store)
-    let cache = ChatCache(store: store)
     let contacts = await contactResolverFactory()
     let config = MessageWatcherConfiguration(
       debounceInterval: debounceInterval,
@@ -98,38 +115,16 @@ enum WatchCommand {
       includeReactions: includeReactions
     )
 
-    let bbEvents = values.flag("bbEvents")
-    if bbEvents {
-      let path = MessagesLauncher.shared.bridgeEventsFile
-      let tailer = IMsgEventTailer(path: path)
-      Task {
-        for await event in tailer.events() {
-          if runtime.jsonOutput {
-            var obj: [String: Any] = [
-              "kind": "bridge-event",
-              "event": event.name,
-            ]
-            if let ts = event.timestamp { obj["ts"] = ts }
-            obj["data"] = event.decodedPayload()
-            try? JSONLines.printObject(obj)
-          } else {
-            let stamp = event.timestamp ?? CLIISO8601.format(Date())
-            StdoutWriter.writeLine("\(stamp) [bridge] \(event.name)")
-          }
-        }
-      }
-    }
-
-    let stream = streamProvider(watcher, chatID, sinceRowID, config)
-    for try await rawMessage in stream {
-      if !filter.allows(rawMessage) {
-        continue
-      }
-      let message = runtime.redactCodes ? rawMessage.redactingSecurityCodes() : rawMessage
+    let stream = streamProvider(watcher, chatID, sinceRowID, config, filter)
+    let redactCodes = runtime.redactCodes
+    let emitMessage: @Sendable (Message) throws -> Void = { rawMessage in
+      // Single choke point for every watch emission — JSON payload, plain
+      // line, and reaction line all read from `message` below, so redacting
+      // here cannot be bypassed by one of the output shapes.
+      let message = redactCodes ? rawMessage.redactingSecurityCodes() : rawMessage
       if runtime.jsonOutput {
-        let payload = try await buildMessagePayload(
+        let payload = try buildMessagePayload(
           store: store,
-          cache: cache,
           message: message,
           includeAttachments: true,
           includeReactions: true,
@@ -137,7 +132,7 @@ enum WatchCommand {
           contactResolver: contacts
         )
         try JSONLines.printObject(payload)
-        continue
+        return
       }
       let direction = message.isFromMe ? "sent" : "recv"
       let timestamp = CLIISO8601.format(message.date)
@@ -150,7 +145,7 @@ enum WatchCommand {
         StdoutWriter.writeLine(
           "\(timestamp) [\(direction)] \(sender) \(action) \(reactionType.emoji) reaction to \(targetGUID)"
         )
-        continue
+        return
       }
       let body = message.poll.map { pollDisplayText(for: $0) } ?? message.text
       StdoutWriter.writeLine("\(timestamp) [\(direction)] \(sender): \(body)")
@@ -166,6 +161,47 @@ enum WatchCommand {
           )
         }
       }
+    }
+
+    func watchDatabase() async throws {
+      for try await message in stream {
+        try Task.checkCancellation()
+        try emitMessage(message)
+      }
+    }
+
+    guard values.flag("bbEvents") else {
+      try await watchDatabase()
+      return
+    }
+
+    let bridgeStream = try? bridgeStreamProvider(MessagesLauncher.shared.bridgeEventsFile)
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      defer { group.cancelAll() }
+      if let bridgeStream {
+        group.addTask {
+          do {
+            for try await event in bridgeStream {
+              try Task.checkCancellation()
+              if runtime.jsonOutput {
+                var object: [String: Any] = [
+                  "kind": "bridge-event",
+                  "event": event.name,
+                  "data": event.decodedPayload(),
+                ]
+                if let timestamp = event.timestamp { object["ts"] = timestamp }
+                try JSONLines.printObject(object)
+              } else {
+                let timestamp = event.timestamp ?? CLIISO8601.format(Date())
+                StdoutWriter.writeLine("\(timestamp) [bridge] \(event.name)")
+              }
+            }
+          } catch {}
+        }
+      }
+
+      try await watchDatabase()
+      try Task.checkCancellation()
     }
   }
 }

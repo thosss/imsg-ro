@@ -33,6 +33,15 @@ imsg watch --chat-id 42 --since-rowid 9000 --json
 
 If you don't pass `--since-rowid`, watch starts at the newest message at the moment of launch. Messages written before then are not replayed; use [`history`](history.md) for that.
 
+ROWID cursors belong to one database generation. After replacing or restoring
+`chat.db`, discard cursors from the previous file and choose a starting cursor
+for the replacement.
+
+The watcher keeps a bounded queue of 256 eligible messages per stream. Date and
+participant filters are applied before queue admission, while the physical scan
+cursor still advances across filtered rows. This prevents excluded traffic from
+consuming a subscriber's capacity.
+
 ## Reactions
 
 By default, tapback events are excluded so the stream stays focused on actual messages. Opt in with `--reactions`:
@@ -91,6 +100,21 @@ Lower the debounce if you need lower latency and can tolerate occasional duplica
 
 `--debounce` accepts Go-style durations: `100ms`, `1s`, `2s500ms`.
 
+## RPC backpressure and overflow
+
+JSON-RPC subscribers can set `buffer_limit` from 1 through 4096 (default 256).
+When the first eligible message cannot enter a full buffer, the watcher stops
+its file sources and polling. Messages already accepted into the buffer drain,
+then RPC emits a terminal `watch.overflow` notification containing
+`resume_after_rowid` and reason `buffer_limit_exceeded`.
+
+Resume with that value as the exclusive `since_rowid` for `messages.after` or a
+new `watch.subscribe`. The cursor is deliberately conservative: replaying a
+message is possible, but skipping the first dropped eligible message is not.
+Cancellation and explicit unsubscribe do not report overflow or a generic
+error. Once `watch.unsubscribe` responds, no later notification for that
+subscription can appear.
+
 ## How it knows when to read
 
 The watcher listens for `kqueue` filesystem events on:
@@ -123,3 +147,24 @@ When you send a link, Messages writes a "balloon" placeholder row first, then la
 Each line is a complete JSON object. See [JSON output → Message](json.md#message) for the full field list. For tapback events also see the reaction fields above. For native polls, see [JSON output → Native poll extension](json.md#native-poll-extension).
 
 Lines are flushed immediately when stdout is buffered (e.g. piped through `jq -c`), so downstream consumers don't experience batching artifacts.
+
+## Bridge events
+
+On macOS, `--bb-events` adds typing and alias-removal events written by an
+injected bridge:
+
+```bash
+imsg watch --bb-events --json
+```
+
+Database messages and bridge events are two independently ordered,
+best-effort streams sharing serialized stdout. Each source preserves its own
+order, but their relative output order has no meaning. Database messages remain
+resumable with `--since-rowid`; bridge events start at the event log's current
+EOF, have no replay cursor, and are not resumable. The CLI securely provisions
+a private empty event log when needed, so it can start before bridge injection
+and receive later events. If the log cannot be created or opened, overflows,
+fails while reading, or ends, database watching continues normally. RPC
+subscriptions never provision this path and remain gated on an active bridge
+with an existing readable regular event log. When the database stream ends or
+fails, `watch` cancels and awaits the bridge stream before exiting.

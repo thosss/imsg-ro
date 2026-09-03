@@ -25,7 +25,8 @@ import Foundation
     }
 
     private var containerPath: String {
-      NSHomeDirectory() + "/Library/Containers/com.apple.MobileSMS/Data"
+      containerPathOverride
+        ?? NSHomeDirectory() + "/Library/Containers/com.apple.MobileSMS/Data"
     }
 
     /// Inbox directory for v2 RPC requests (`<uuid>.json` files dropped here by
@@ -50,12 +51,26 @@ import Foundation
     private let messagesAppPath =
       "/System/Applications/Messages.app/Contents/MacOS/Messages"
     private let queue = DispatchQueue(label: "imsg.messages.launcher")
-    private let lock = NSLock()
+    private let commandLock = NSLock()
+    private let launchCoordinator = BridgeLaunchCoordinator()
+    private let containerPathOverride: String?
+    private let readyCheckOverride: (() -> Bool)?
+    private let injectedReadyCheckOverride: (() -> Bool)?
+    private let launchOverride: (() throws -> Void)?
 
     /// Path to the dylib to inject.
     public var dylibPath: String = ".build/release/imsg-bridge-helper.dylib"
 
-    private init() {
+    init(
+      containerPath: String? = nil,
+      readyCheck: (() -> Bool)? = nil,
+      injectedReadyCheck: (() -> Bool)? = nil,
+      launch: (() throws -> Void)? = nil
+    ) {
+      self.containerPathOverride = containerPath
+      self.readyCheckOverride = readyCheck
+      self.injectedReadyCheckOverride = injectedReadyCheck
+      self.launchOverride = launch
       if let path = BridgeHelperLocator.resolve() {
         self.dylibPath = path
       }
@@ -63,11 +78,17 @@ import Foundation
 
     /// Check if Messages.app has published the bridge-ready lock file.
     public func hasReadyLockFile() -> Bool {
-      FileManager.default.fileExists(atPath: lockFile)
+      if let readyCheckOverride {
+        return readyCheckOverride()
+      }
+      return FileManager.default.fileExists(atPath: lockFile)
     }
 
     /// Check if Messages.app is running with our dylib (lock file exists and responds to ping).
     public func isInjectedAndReady() -> Bool {
+      if let injectedReadyCheckOverride {
+        return injectedReadyCheckOverride()
+      }
       guard hasReadyLockFile() else {
         return false
       }
@@ -85,17 +106,26 @@ import Foundation
 
     /// Ensure Messages.app is running with our dylib injected.
     public func ensureRunning() throws {
-      if isInjectedAndReady() { return }
-      try launchInjectedMessages()
+      try launchCoordinator.runSynchronously(
+        readinessCheck: isInjectedAndReady,
+        operation: performLaunchInjectedMessages
+      )
     }
 
     /// Ensure Messages.app is launched with the helper without touching legacy IPC.
     public func ensureLaunched() throws {
-      if hasReadyLockFile() { return }
-      try launchInjectedMessages()
+      try launchCoordinator.runSynchronously(
+        readinessCheck: hasReadyLockFile,
+        operation: performLaunchInjectedMessages
+      )
     }
 
-    private func launchInjectedMessages() throws {
+    private func performLaunchInjectedMessages() throws {
+      if let launchOverride {
+        try launchOverride()
+        return
+      }
+
       switch Self.currentSIPStatus() {
       case .disabled:
         break
@@ -122,7 +152,7 @@ import Foundation
       // silently fails to deliver events).
       try ensureSecureQueueDirectory(bridgeInboxDirectory)
       try ensureSecureQueueDirectory(bridgeOutboxDirectory)
-      try cleanQueueDirectory(bridgeInboxDirectory)
+      try cleanQueueDirectory(bridgeInboxDirectory, preservingClaims: true)
       try cleanQueueDirectory(bridgeOutboxDirectory)
 
       try launchWithInjection()
@@ -151,15 +181,20 @@ import Foundation
       }
     }
 
-    private func cleanQueueDirectory(_ path: String) throws {
+    private func cleanQueueDirectory(_ path: String, preservingClaims: Bool = false) throws {
       if SecurePath.hasSymlinkComponent(path) {
         throw MessagesLauncherError.socketError("RPC queue path traverses a symlink: \(path)")
       }
       let entries = try FileManager.default.contentsOfDirectory(atPath: path)
       for entry in entries {
+        if preservingClaims, entry.contains(".processing.") { continue }
         try FileManager.default.removeItem(atPath: (path as NSString).appendingPathComponent(entry))
       }
     }
+
+    /// Bound for short helper processes (`killall`, `csrutil`). Must not hang
+    /// launcher/RPC setup if the helper stalls.
+    static let helperProcessTimeout: TimeInterval = 15
 
     /// Kill Messages.app if running.
     public func killMessages() {
@@ -169,7 +204,7 @@ import Foundation
       task.standardOutput = FileHandle.nullDevice
       task.standardError = FileHandle.nullDevice
       try? task.run()
-      task.waitUntilExit()
+      _ = ProcessTimeout.waitUntilExit(task, timeout: Self.helperProcessTimeout)
     }
 
     /// Send a command asynchronously.
@@ -187,7 +222,7 @@ import Foundation
     public func sendCommand(
       action: String, params: [String: Any], timeout: TimeInterval
     ) async throws -> [String: Any] {
-      try ensureRunning()
+      try await ensureRunning()
       // Serialize params to JSON data to cross the Sendable boundary safely
       let paramsData = try JSONSerialization.data(withJSONObject: params, options: [])
       return try await withCheckedThrowingContinuation {
@@ -224,7 +259,9 @@ import Foundation
       } catch {
         return nil
       }
-      task.waitUntilExit()
+      if ProcessTimeout.waitUntilExit(task, timeout: helperProcessTimeout) {
+        return nil
+      }
       let data = output.fileHandleForReading.readDataToEndOfFile()
       guard let text = String(data: data, encoding: .utf8) else { return nil }
       return text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -278,9 +315,10 @@ import Foundation
     }
 
     private func waitForReady(timeout: TimeInterval) throws {
-      let deadline = Date().addingTimeInterval(timeout)
+      let clock = ContinuousClock()
+      let deadline = clock.now + .seconds(max(0.05, timeout))
 
-      while Date() < deadline {
+      while clock.now < deadline {
         if FileManager.default.fileExists(atPath: lockFile) {
           Thread.sleep(forTimeInterval: 0.5)
           return
@@ -294,8 +332,8 @@ import Foundation
     private func sendCommandSync(
       action: String, params: [String: Any], timeout: TimeInterval
     ) throws -> [String: Any] {
-      lock.lock()
-      defer { lock.unlock() }
+      commandLock.lock()
+      defer { commandLock.unlock() }
 
       let command: [String: Any] = [
         "id": Int(Date().timeIntervalSince1970 * 1000),
@@ -303,11 +341,17 @@ import Foundation
         "params": params,
       ]
 
-      let jsonData = try JSONSerialization.data(withJSONObject: command, options: [])
-      try jsonData.write(to: URL(fileURLWithPath: commandFile))
+      let jsonData: Data
+      do {
+        jsonData = try JSONSerialization.data(withJSONObject: command, options: [])
+        try jsonData.write(to: URL(fileURLWithPath: commandFile))
+      } catch {
+        throw MessagesLauncherError.commandNotPublished(error.localizedDescription)
+      }
 
-      let deadline = Date().addingTimeInterval(timeout)
-      while Date() < deadline {
+      let clock = ContinuousClock()
+      let deadline = clock.now + .seconds(max(0.05, timeout))
+      while clock.now < deadline {
         Thread.sleep(forTimeInterval: 0.05)
 
         guard
@@ -331,7 +375,23 @@ import Foundation
         }
       }
 
-      throw MessagesLauncherError.socketError("Timeout waiting for response")
+      throw MessagesLauncherError.commandTimeout(action)
+    }
+  }
+
+  extension MessagesLauncher {
+    public func ensureRunning() async throws {
+      try await launchCoordinator.run(
+        readinessCheck: isInjectedAndReady,
+        operation: performLaunchInjectedMessages
+      )
+    }
+
+    public func ensureLaunched() async throws {
+      try await launchCoordinator.run(
+        readinessCheck: hasReadyLockFile,
+        operation: performLaunchInjectedMessages
+      )
     }
   }
 #else
@@ -354,7 +414,15 @@ import Foundation
       throw MessagesLauncherError.launchFailed("Messages.app is only available on macOS.")
     }
 
+    public func ensureRunning() async throws {
+      throw MessagesLauncherError.launchFailed("Messages.app is only available on macOS.")
+    }
+
     public func ensureLaunched() throws {
+      throw MessagesLauncherError.launchFailed("Messages.app is only available on macOS.")
+    }
+
+    public func ensureLaunched() async throws {
       throw MessagesLauncherError.launchFailed("Messages.app is only available on macOS.")
     }
 
@@ -397,6 +465,8 @@ public enum MessagesLauncherError: Error, CustomStringConvertible {
   case socketTimeout
   case socketError(String)
   case invalidResponse
+  case commandNotPublished(String)
+  case commandTimeout(String)
 
   public var description: String {
     switch self {
@@ -422,6 +492,10 @@ public enum MessagesLauncherError: Error, CustomStringConvertible {
       return "IPC error: \(reason)"
     case .invalidResponse:
       return "Invalid response from Messages.app helper"
+    case .commandNotPublished(let reason):
+      return "Bridge command was not published: \(reason)"
+    case .commandTimeout(let action):
+      return "Timeout waiting for bridge command '\(action)'"
     }
   }
 }

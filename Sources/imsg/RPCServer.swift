@@ -16,92 +16,75 @@ typealias BridgeInvoker = (
 typealias AttachmentStager = (_ path: String) throws -> String
 typealias StickerStager = (_ path: String) throws -> PreparedStickerAsset
 
+enum RPCExecutionResult: Sendable, Equatable {
+  case completed
+  case deliveryFailure(DeliveryFailure)
+}
+
+struct RPCMutationPoisonSignal: Error, Sendable {
+  let failure: DeliveryFailure
+}
+
 protocol RPCOutput: Sendable {
   func sendResponse(id: Any, result: Any)
   func sendError(id: Any?, error: RPCError)
   func sendNotification(method: String, params: Any)
+  func flush()
 }
 
-/// Methods exposed by `imsg rpc` over JSON-RPC. Advertised to clients via
-/// `imsg status --json` (`rpc_methods` field) so capability-aware consumers can
-/// inspect the exact surface exposed by the installed binary.
-///
-/// Keep in sync with the dispatch switch in `RPCServer.handleLine`.
-let kSupportedRPCMethods: [String] = [
-  "chats.list",
-  "chats.create",
-  "chats.delete",
-  "chats.markUnread",
-  "messages.stats",
-  "messages.history",
-  "watch.subscribe",
-  "watch.unsubscribe",
-  "send",
-  "send.rich",
-  "send.attachment",
-  "send.sticker",
-  "messages.scheduled",
-  "poll.send",
-  "messages.poll.send",
-  "poll.vote",
-  "messages.poll.vote",
-  "poll.unvote",
-  "polls.unvote",
-  "messages.poll.unvote",
-  "tapback",
-  "typing",
-  "read",
-  "message.edit",
-  "message.unsend",
-  "message.delete",
-  "message.notifyAnyways",
-  "message.send_status",
-  "group.rename",
-  "group.setIcon",
-  "group.addParticipant",
-  "group.removeParticipant",
-  "group.leave",
-  "contacts.shouldShareContact",
-  "contacts.shareContactCard",
-  "handles.check",
-]
+typealias RPCWatchStreamProvider = (
+  _ watcher: MessageWatcher,
+  _ chatID: Int64?,
+  _ sinceRowID: Int64?,
+  _ configuration: MessageWatcherConfiguration,
+  _ filter: MessageFilter
+) -> AsyncThrowingStream<Message, Error>
 
-/// RPC methods that only read state. This is the allow-list consulted by the
-/// read-only gate in `handleLine`: when the server runs in read-only mode
-/// (`imsg rpc --read-only`), only methods in this set are permitted — every
-/// other method name, known or not, is refused. Being an allow-list (rather
-/// than a block-list of mutating methods) keeps the gate fail-closed even if a
-/// future mutating method is added to the dispatch switch below but not
-/// registered in `kSupportedRPCMethods`.
+typealias RPCBridgeEventStreamProvider = (
+  _ path: String,
+  _ bufferLimit: Int
+) throws -> AsyncThrowingStream<IMsgEventTailer.Event, Error>
+
+/// RPC methods permitted while the server runs in read-only mode
+/// (`imsg rpc --read-only`). Derived from each method's declared
+/// `RPCMethodDescriptor.lane` rather than a hand-maintained name list.
 ///
-/// Every method in `kSupportedRPCMethods` must appear in exactly one of
-/// `kReadOnlyRPCMethods` or `kMutatingRPCMethods`; a test enforces this so any
-/// newly added method is deliberately classified.
-let kReadOnlyRPCMethods: Set<String> = [
-  "chats.list",
-  "messages.stats",
-  "messages.history",
-  "watch.subscribe",
-  "watch.unsubscribe",
-  "messages.scheduled",
-  "message.send_status",
-  "contacts.shouldShareContact",
-  "handles.check",
-]
+/// Fail-closed by construction, in two ways:
+///
+/// 1. Only a method with a registered descriptor can appear here, so an
+///    unrecognized method name is refused rather than falling through to the
+///    dispatch switch.
+/// 2. `RPCMethodDescriptor` requires an explicit `lane:` at every declaration
+///    site — there is no default — so a newly added mutating method is denied
+///    the moment it is written, without anyone remembering to update a
+///    separate allow-list.
+///
+/// `.read` and `.control` are both permitted: `.control` covers `initialize`,
+/// `watch.subscribe`/`unsubscribe`, and `bridge.events.subscribe`, which
+/// manage this process's own streams and never write to Messages.
+///
+/// Platform filtering matters for the gate's safety: a macOS-only mutating
+/// method must not become permitted just because it is not compiled on Linux,
+/// so descriptors are screened by `isCompiledForCurrentPlatform` before their
+/// lane is consulted.
+let kReadOnlyRPCMethods: Set<String> = Set(
+  rpcMethodDescriptors
+    .filter { $0.isCompiledForCurrentPlatform && $0.lane != .mutation }
+    .flatMap(\.names)
+)
 
 /// RPC methods that mutate state. Not consulted by the runtime gate directly
-/// (see `kReadOnlyRPCMethods`); kept for documentation and to let a test
-/// assert that every advertised method is classified as exactly one of read
-/// or mutating.
+/// (see `kReadOnlyRPCMethods`); kept so a test can assert that every advertised
+/// method is classified as exactly one of read or mutating.
 let kMutatingRPCMethods: Set<String> = Set(kSupportedRPCMethods)
   .subtracting(kReadOnlyRPCMethods)
 
-final class RPCServer {
-  let store: MessageStore
-  let watcher: MessageWatcher
+// MessageStore, stdout, and watcher state are serial-queue-owned; subscriptions are actors.
+// Remaining production dependencies are immutable or internally synchronized.
+final class RPCServer: @unchecked Sendable {
+  let databaseResources: RPCDatabaseResourceOwner
   let output: RPCOutput
-  let cache: ChatCache
-  let subscriptions = SubscriptionStore()
+  let subscriptions: SubscriptionStore
   let verbose: Bool
   /// When true, mutating methods are refused with `RPCError.readOnly`.
   let readOnly: Bool
@@ -117,7 +100,12 @@ final class RPCServer {
   let isBridgeReady: () -> Bool
   let startTyping: (String) throws -> Void
   let stopTyping: (String) throws -> Void
+  let markAsRead: (String) async throws -> Void
   let contactResolver: any ContactResolving
+  let watchStreamProvider: RPCWatchStreamProvider
+  let bridgeEventsPath: String
+  let bridgeEventPathUsable: @Sendable (String) -> Bool
+  let bridgeEventStreamProvider: RPCBridgeEventStreamProvider
 
   init(
     store: MessageStore,
@@ -128,7 +116,7 @@ final class RPCServer {
     sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
     resolveSentMessage: @escaping SentMessageResolver = RPCServer.resolveSentMessage,
     invokeBridge: @escaping BridgeInvoker = { action, params in
-      try await IMsgBridgeClient.shared.invoke(action: action, params: params)
+      try await IMsgBridgeClient.shared.invokeWithoutLaunching(action: action, params: params)
     },
     stageAttachment: @escaping AttachmentStager = MessageSender.stageAttachmentForMessagesApp,
     stageSticker: @escaping StickerStager = {
@@ -137,18 +125,34 @@ final class RPCServer {
     prepareRichLink: @escaping RichLinkPrepare = { rawURL in
       try await RichLinkPreparer.prepare(rawURL)
     },
-    isBridgeReady: @escaping () -> Bool = { IMsgBridgeClient.shared.isReady() },
+    isBridgeReady: @escaping () -> Bool = { true },
     startTyping: @escaping (String) throws -> Void = {
       try TypingIndicator.startTyping(chatIdentifier: $0)
     },
     stopTyping: @escaping (String) throws -> Void = {
       try TypingIndicator.stopTyping(chatIdentifier: $0)
     },
-    contactResolver: any ContactResolving = NoOpContactResolver()
+    markAsRead: @escaping (String) async throws -> Void = {
+      try await IMCoreBridge.shared.markAsRead(handle: $0)
+    },
+    contactResolver: any ContactResolving = NoOpContactResolver(),
+    bridgeEventsPath: String = MessagesLauncher.shared.bridgeEventsFile,
+    bridgeEventPathUsable: @escaping @Sendable (String) -> Bool = rpcBridgeEventPathUsable,
+    bridgeEventStreamProvider: @escaping RPCBridgeEventStreamProvider = { path, bufferLimit in
+      try IMsgEventTailer(path: path, bufferLimit: bufferLimit).events()
+    },
+    watchStreamProvider: @escaping RPCWatchStreamProvider = {
+      watcher, chatID, sinceRowID, configuration, filter in
+      watcher.stream(
+        chatID: chatID,
+        sinceRowID: sinceRowID,
+        configuration: configuration,
+        filter: filter
+      )
+    }
   ) {
-    self.store = store
-    self.watcher = MessageWatcher(store: store)
-    self.cache = ChatCache(store: store)
+    self.databaseResources = RPCDatabaseResourceOwner(store: store)
+    self.subscriptions = SubscriptionStore(limit: 64)
     self.verbose = verbose
     self.readOnly = readOnly
     self.redactCodes = redactCodes
@@ -162,20 +166,128 @@ final class RPCServer {
     self.isBridgeReady = isBridgeReady
     self.startTyping = startTyping
     self.stopTyping = stopTyping
+    self.markAsRead = markAsRead
     self.contactResolver = contactResolver
+    self.bridgeEventsPath = bridgeEventsPath
+    self.bridgeEventPathUsable = bridgeEventPathUsable
+    self.bridgeEventStreamProvider = bridgeEventStreamProvider
+    self.watchStreamProvider = watchStreamProvider
+  }
+
+  init(
+    databasePath: String,
+    verbose: Bool,
+    readOnly: Bool = false,
+    redactCodes: Bool = false,
+    output: RPCOutput = RPCWriter(),
+    storeFactory: @escaping RPCMessageStoreFactory = { try MessageStore(path: $0) },
+    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+    resolveSentMessage: @escaping SentMessageResolver = RPCServer.resolveSentMessage,
+    invokeBridge: @escaping BridgeInvoker = { action, params in
+      try await IMsgBridgeClient.shared.invokeWithoutLaunching(action: action, params: params)
+    },
+    stageAttachment: @escaping AttachmentStager = MessageSender.stageAttachmentForMessagesApp,
+    stageSticker: @escaping StickerStager = { try StickerAssetPreparer.prepare(at: $0) },
+    prepareRichLink: @escaping RichLinkPrepare = { try await RichLinkPreparer.prepare($0) },
+    isBridgeReady: @escaping () -> Bool = { IMsgBridgeClient.shared.isReady() },
+    startTyping: @escaping (String) throws -> Void = {
+      try TypingIndicator.startTyping(chatIdentifier: $0)
+    },
+    stopTyping: @escaping (String) throws -> Void = {
+      try TypingIndicator.stopTyping(chatIdentifier: $0)
+    },
+    markAsRead: @escaping (String) async throws -> Void = {
+      try await IMCoreBridge.shared.markAsRead(handle: $0)
+    },
+    contactResolver: any ContactResolving = NoOpContactResolver(),
+    bridgeEventsPath: String = MessagesLauncher.shared.bridgeEventsFile,
+    bridgeEventPathUsable: @escaping @Sendable (String) -> Bool = rpcBridgeEventPathUsable,
+    bridgeEventStreamProvider: @escaping RPCBridgeEventStreamProvider = { path, bufferLimit in
+      try IMsgEventTailer(path: path, bufferLimit: bufferLimit).events()
+    },
+    watchStreamProvider: @escaping RPCWatchStreamProvider = {
+      watcher, chatID, sinceRowID, configuration, filter in
+      watcher.stream(
+        chatID: chatID,
+        sinceRowID: sinceRowID,
+        configuration: configuration,
+        filter: filter
+      )
+    }
+  ) {
+    self.databaseResources = RPCDatabaseResourceOwner(path: databasePath, factory: storeFactory)
+    self.subscriptions = SubscriptionStore(limit: 64)
+    self.verbose = verbose
+    self.readOnly = readOnly
+    self.redactCodes = redactCodes
+    self.output = output
+    self.sendMessage = sendMessage
+    self.resolveSentMessage = resolveSentMessage
+    self.bridgeInvoker = invokeBridge
+    self.stageAttachment = stageAttachment
+    self.stageSticker = stageSticker
+    self.prepareRichLink = prepareRichLink
+    self.isBridgeReady = isBridgeReady
+    self.startTyping = startTyping
+    self.stopTyping = stopTyping
+    self.markAsRead = markAsRead
+    self.contactResolver = contactResolver
+    self.bridgeEventsPath = bridgeEventsPath
+    self.bridgeEventPathUsable = bridgeEventPathUsable
+    self.bridgeEventStreamProvider = bridgeEventStreamProvider
+    self.watchStreamProvider = watchStreamProvider
   }
 
   func run() async throws {
-    while let line = readLine() {
-      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmed.isEmpty { continue }
-      await handleLine(trimmed)
+    try await run(lines: RPCLineSource.standardInput())
+  }
+
+  func run(lines: RPCLineStream) async throws {
+    let scheduler = RPCScheduler(server: self)
+    try await withTaskCancellationHandler {
+      try await run(lines: lines, scheduler: scheduler)
+    } onCancel: {
+      Task.detached { [subscriptions] in
+        await scheduler.stopAdmissionAndCancelReadControl()
+        await subscriptions.cancelAll()
+      }
     }
+  }
+
+  private func run(lines: RPCLineStream, scheduler: RPCScheduler) async throws {
+    var sourceError: Error?
+    do {
+      for try await line in lines {
+        try Task.checkCancellation()
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { continue }
+        await scheduler.submit(trimmed)
+      }
+    } catch {
+      sourceError = error
+    }
+
+    let cancelled = Task.isCancelled || sourceError is CancellationError
+    if cancelled || sourceError != nil {
+      await scheduler.stopAdmissionAndCancelReadControl()
+    } else {
+      await scheduler.stopAdmission()
+    }
+    // EOF and cancellation stop live producers before accepted request drain.
     await subscriptions.cancelAll()
+    await scheduler.waitUntilDrained()
+    output.flush()
+
+    if let sourceError {
+      throw sourceError
+    }
+    if cancelled || Task.isCancelled {
+      throw CancellationError()
+    }
   }
 
   func handleLineForTesting(_ line: String) async {
-    await handleLine(line)
+    _ = await handleLine(line)
   }
 
   func respond(id: Any?, result: Any) {
@@ -183,127 +295,171 @@ final class RPCServer {
     output.sendResponse(id: id, result: result)
   }
 
-  private func handleLine(_ line: String) async {
+  func handleLine(_ line: String) async -> RPCExecutionResult {
     let request: RPCRequest
     switch RPCRequestParser.parse(line) {
     case .success(let parsed):
       request = parsed
     case .failure(let failure):
-      output.sendError(id: failure.id, error: failure.error)
-      return
+      if failure.shouldRespond {
+        output.sendError(id: failure.id, error: failure.error)
+      }
+      return .completed
     }
     let method = request.method
     let params = request.params
     let id = request.id
 
-    // Allow-list, not block-list: only methods explicitly known to be
-    // read-only pass through. This stays fail-closed even if a future
-    // mutating method is added to the switch below but someone forgets to
-    // register it in `kSupportedRPCMethods` — it is denied by omission
-    // rather than silently permitted.
+    // Allow-list, not block-list: a method passes only if its descriptor
+    // declares a non-mutating lane for this platform (see
+    // `kReadOnlyRPCMethods`). Any unregistered method name is denied by
+    // omission, so the gate stays fail-closed regardless of what the dispatch
+    // switch below happens to cover.
+    //
+    // The refusal is evaluated before dispatch, so nothing runs. Notifications
+    // get no response, per JSON-RPC — they are still refused, just silently.
     if readOnly && !kReadOnlyRPCMethods.contains(method) {
-      output.sendError(id: id, error: RPCError.readOnly(method))
-      return
+      if !request.isNotification {
+        output.sendError(id: id, error: RPCError.readOnly(method))
+      }
+      return .completed
     }
 
     do {
-      switch method {
-      case "chats.list":
-        try await handleChatsList(id: id, params: params)
-      case "messages.stats":
-        guard request.paramsAreNamed else {
-          throw RPCError.invalidParams("messages.stats params must be an object")
+      guard let route = rpcDispatchRoutes[method] else {
+        if !request.isNotification {
+          output.sendError(id: id, error: RPCError.methodNotFound(method))
         }
-        try await handleMessagesStats(id: id, params: params)
-      case "messages.history":
-        try await handleMessagesHistory(id: id, params: params)
-      case "watch.subscribe":
-        try await handleWatchSubscribe(id: id, params: params)
-      case "watch.unsubscribe":
-        try await handleWatchUnsubscribe(id: id, params: params)
-      case "send":
-        try await handleSend(params: params, id: id)
-      case "send.rich":
-        try await handleSendRich(params: params, id: id)
-      case "send.attachment":
-        try await handleSendAttachment(params: params, id: id)
-      case "send.sticker":
-        guard request.paramsAreNamed else {
-          throw RPCError.invalidParams("send.sticker params must be an object")
-        }
-        try await handleSendSticker(params: params, id: id)
-      case "messages.scheduled":
-        guard request.paramsAreNamed else {
-          throw RPCError.invalidParams("messages.scheduled params must be an object")
-        }
-        try await handleMessagesScheduled(params: params, id: id)
-      case "poll.send", "messages.poll.send":
-        try await handlePollSend(params: params, id: id)
-      case "poll.vote", "messages.poll.vote":
-        try await handlePollVote(params: params, id: id)
-      case "poll.unvote", "polls.unvote", "messages.poll.unvote":
-        try await handlePollUnvote(params: params, id: id)
-      case "tapback":
-        try await handleTapback(params: params, id: id)
-      case "typing":
-        try await handleTyping(params: params, id: id)
-      case "read":
-        try await handleRead(params: params, id: id)
-      case "message.edit":
-        try await handleMessageEdit(params: params, id: id)
-      case "message.unsend":
-        try await handleMessageUnsend(params: params, id: id)
-      case "message.delete":
-        try await handleMessageDelete(params: params, id: id)
-      case "message.notifyAnyways":
-        try await handleMessageNotifyAnyways(params: params, id: id)
-      case "message.send_status":
-        try await handleMessageSendStatus(params: params, id: id)
-      case "chats.create":
-        try await handleChatsCreate(id: id, params: params)
-      case "chats.delete":
-        try await handleChatsDelete(id: id, params: params)
-      case "chats.markUnread":
-        try await handleChatsMarkUnread(id: id, params: params)
-      case "group.rename":
-        try await handleGroupRename(id: id, params: params)
-      case "group.setIcon":
-        try await handleGroupSetIcon(id: id, params: params)
-      case "group.addParticipant":
-        try await handleGroupAddParticipant(id: id, params: params)
-      case "group.removeParticipant":
-        try await handleGroupRemoveParticipant(id: id, params: params)
-      case "group.leave":
-        try await handleGroupLeave(id: id, params: params)
-      case "contacts.shouldShareContact":
-        guard request.paramsAreNamed else {
-          throw RPCError.invalidParams("contacts.shouldShareContact params must be an object")
-        }
-        try await handleNamePhotoStatus(params: params, id: id)
-      case "contacts.shareContactCard":
-        guard request.paramsAreNamed else {
-          throw RPCError.invalidParams("contacts.shareContactCard params must be an object")
-        }
-        try await handleNamePhotoShare(params: params, id: id)
-      case "handles.check":
-        try await handleHandlesCheck(params: params, id: id)
-      default:
-        output.sendError(id: id, error: RPCError.methodNotFound(method))
+        return .completed
       }
+      switch route {
+      case .initialize:
+        try await handleInitialize(id: id, params: params)
+      case .status:
+        try await handleStatus(id: id, params: params)
+      case .chatsList:
+        try await handleChatsList(id: id, params: params)
+      case .messagesStats:
+        try await handleMessagesStats(id: id, params: params)
+      case .messagesHistory:
+        try await handleMessagesHistory(id: id, params: params)
+      case .messagesSearch:
+        try await handleMessagesSearch(id: id, params: params)
+      case .messagesAfter:
+        try await handleMessagesAfter(id: id, params: params)
+      case .watchSubscribe:
+        try await handleWatchSubscribe(id: id, params: params)
+      case .bridgeEventsSubscribe:
+        try await handleBridgeEventsSubscribe(id: id, params: params)
+      case .watchUnsubscribe:
+        try await handleWatchUnsubscribe(id: id, params: params)
+      case .send:
+        try await handleSend(params: params, id: id)
+      case .sendTracked:
+        try await handleSendTracked(params: params, id: id)
+      case .sendRich:
+        try await handleSendRich(params: params, id: id)
+      case .sendAttachment:
+        try await handleSendAttachment(params: params, id: id)
+      case .sendMultipart:
+        try await handleSendMultipart(params: params, id: id)
+      case .sendSticker:
+        try await handleSendSticker(params: params, id: id)
+      case .messagesScheduled:
+        try await handleMessagesScheduled(params: params, id: id)
+      case .pollSend:
+        try await handlePollSend(params: params, id: id)
+      case .pollVote:
+        try await handlePollVote(params: params, id: id)
+      case .pollUnvote:
+        try await handlePollUnvote(params: params, id: id)
+      case .tapback:
+        try await handleTapback(params: params, id: id)
+      case .typing:
+        try await handleTyping(params: params, id: id)
+      case .read:
+        try await handleRead(params: params, id: id)
+      case .messageEdit:
+        try await handleMessageEdit(params: params, id: id)
+      case .messageUnsend:
+        try await handleMessageUnsend(params: params, id: id)
+      case .messageDelete:
+        try await handleMessageDelete(params: params, id: id)
+      case .messageNotifyAnyways:
+        try await handleMessageNotifyAnyways(params: params, id: id)
+      case .messageSendStatus:
+        try await handleMessageSendStatus(params: params, id: id)
+      case .chatsCreate:
+        try await handleChatsCreate(id: id, params: params)
+      case .chatsDelete:
+        try await handleChatsDelete(id: id, params: params)
+      case .chatsMarkUnread:
+        try await handleChatsMarkUnread(id: id, params: params)
+      case .groupRename:
+        try await handleGroupRename(id: id, params: params)
+      case .groupSetIcon:
+        try await handleGroupSetIcon(id: id, params: params)
+      case .groupAddParticipant:
+        try await handleGroupAddParticipant(id: id, params: params)
+      case .groupRemoveParticipant:
+        try await handleGroupRemoveParticipant(id: id, params: params)
+      case .groupLeave:
+        try await handleGroupLeave(id: id, params: params)
+      case .contactsShouldShare:
+        try await handleNamePhotoStatus(params: params, id: id)
+      case .contactsShare:
+        try await handleNamePhotoShare(params: params, id: id)
+      case .handlesCheck:
+        try await handleHandlesCheck(params: params, id: id)
+      }
+    } catch is CancellationError {
+      return .completed
+    } catch let signal as RPCMutationPoisonSignal {
+      return .deliveryFailure(signal.failure)
+    } catch let failure as DeliveryFailure {
+      if !request.isNotification {
+        output.sendError(id: id, error: RPCError.deliveryFailure(failure))
+      }
+      return .deliveryFailure(failure)
     } catch let err as RPCError {
-      output.sendError(id: id, error: err)
+      if !request.isNotification {
+        output.sendError(id: id, error: err)
+      }
     } catch let err as IMsgError {
-      switch err {
-      case .invalidService, .invalidChatTarget:
-        output.sendError(
-          id: id,
-          error: RPCError.invalidParams(err.errorDescription ?? "invalid params")
-        )
-      default:
+      guard !request.isNotification else { return .completed }
+      if err.isCallerCausedRPCError {
+        output.sendError(id: id, error: RPCError.invalidParams(err.localizedDescription))
+      } else {
         output.sendError(id: id, error: RPCError.internalError(err.localizedDescription))
       }
     } catch {
-      output.sendError(id: id, error: RPCError.internalError(error.localizedDescription))
+      if !request.isNotification {
+        output.sendError(id: id, error: RPCError.internalError(error.localizedDescription))
+      }
+    }
+    return .completed
+  }
+
+  func rejectBusy(_ line: String) {
+    switch RPCRequestParser.parse(line) {
+    case .success(let request):
+      if !request.isNotification {
+        output.sendError(
+          id: request.id,
+          error: RPCError.serverBusy("outstanding request limit exceeded")
+        )
+      }
+    case .failure(let failure):
+      if failure.shouldRespond {
+        output.sendError(id: failure.id, error: failure.error)
+      }
+    }
+  }
+
+  func rejectMutationBlocked(_ line: String, poison: DeliveryFailure) {
+    guard case .success(let request) = RPCRequestParser.parse(line) else { return }
+    if !request.isNotification {
+      output.sendError(id: request.id, error: RPCError.mutationLaneBlocked(poison))
     }
   }
 
@@ -319,5 +475,17 @@ final class RPCServer {
       chatID: chatID,
       sentAt: sentAt
     )
+  }
+}
+
+extension IMsgError {
+  fileprivate var isCallerCausedRPCError: Bool {
+    switch self {
+    case .invalidISODate, .invalidService, .unsupportedService, .invalidChatTarget,
+      .invalidReaction, .unsupportedReaction, .chatNotFound:
+      return true
+    case .permissionDenied, .appleScriptFailure, .typingIndicatorFailed:
+      return false
+    }
   }
 }

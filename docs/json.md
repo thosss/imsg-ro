@@ -20,7 +20,7 @@ Returned by `imsg chats --json` and JSON-RPC `chats.list`.
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | int | `chat.ROWID`. Stable within one DB. Preferred routing handle. |
-| `name` | string | Display name, contact match, or raw handle fallback. |
+| `name` | string | Messages display name or raw chat identifier fallback. |
 | `display_name` | string | Group title from `chat.display_name`. Empty for direct chats without a custom name. |
 | `contact_name` | string | Resolved Contacts name (when permission granted). |
 | `identifier` | string | `chat.chat_identifier`. Portable. |
@@ -36,11 +36,12 @@ Returned by `imsg chats --json` and JSON-RPC `chats.list`.
 
 ## Message
 
-Returned by `imsg history`, `imsg search`, `imsg watch`, and the JSON-RPC `messages.history` and `watch.subscribe` notifications.
+Returned by `imsg history`, `imsg search`, `imsg watch`, and the JSON-RPC
+`messages.history`, `messages.search`, and `watch.subscribe` surfaces.
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `id` | int | rowid. Use as the `--since-rowid` cursor in watch. |
+| `id` | int | Database-instance-scoped rowid. Use as the `--since-rowid` cursor in watch, but discard saved cursors after replacing or restoring the Messages database. |
 | `chat_id` | int | Always present. Preferred routing handle. |
 | `chat_identifier` | string | Portable handle. |
 | `chat_guid` | string | Portable GUID. |
@@ -57,7 +58,7 @@ Returned by `imsg history`, `imsg search`, `imsg watch`, and the JSON-RPC `messa
 | `is_from_me` | bool | True for outbound. |
 | `text` | string | Plain text. Recovered from `attributedBody` when `text` column is empty. |
 | `created_at` | ISO8601 | Message timestamp. |
-| `attachments` | array | Present when `--attachments` is set. See below. |
+| `attachments` | array | Always present. CLI history/watch JSON keeps its historical populated metadata; RPC read methods populate it only when their `attachments` flag is true. See below. |
 | `thread_originator_guid` | string | For inline-reply threads. |
 | `poll` | object | Present for native Apple Messages Polls creation and vote rows. See below. |
 | `is_read` | bool | Inbound only — omitted when `is_from_me` is true. |
@@ -108,7 +109,7 @@ Returned by `imsg chat-background status --chat-id <id> --json`. This surface is
 
 ### URL preview coalescing
 
-Messages may store a link send as two rows: the user's text row and a later `com.apple.messages.URLBalloonProvider` preview row. `history`, `search`, `watch`, `messages.history`, and `watch.subscribe` coalesce those rows into one logical message when the preview immediately follows a same-chat/same-sender text row containing the preview URL. In batch reads the coalesced message includes:
+Messages may store a link send as two rows: the user's text row and a later `com.apple.messages.URLBalloonProvider` preview row. `history`, `search`, `watch`, `messages.history`, `messages.search`, and `watch.subscribe` coalesce those rows into one logical message when the preview immediately follows a same-chat/same-sender text row containing the preview URL. In batch reads the coalesced message includes:
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -121,7 +122,9 @@ Live watch calls do not delay the text message waiting for a preview. If the pre
 
 ### Reaction extensions
 
-Present on `imsg watch --reactions` events:
+Present on standalone reaction rows emitted by `imsg watch --reactions`,
+`watch.subscribe` with `include_reactions: true`, and `messages.after` with
+`include_reactions: true`:
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -131,7 +134,10 @@ Present on `imsg watch --reactions` events:
 | `is_reaction_add` | bool | `true` for add, `false` for remove. |
 | `reacted_to_guid` | string | The message guid this tapback targets. |
 
-`history` deliberately hides reaction rows so they don't duplicate the reacted message. Reaction events only surface in the live watch stream.
+`history` deliberately hides standalone reaction rows so they don't duplicate
+the reacted message. Live watch surfaces emit them only when reactions are
+enabled; `messages.after` includes them in ROWID order only when
+`include_reactions` is `true`.
 
 ### Native poll extension
 
@@ -144,8 +150,8 @@ Native Apple Messages polls are emitted as normal messages with a `poll` object.
 | `poll_guid` | string | The poll's source message GUID when known. |
 | `question` | string | Poll title or question when decoded. For native created polls with an empty payload title, this may be backfilled from the poll's plain caption row. |
 | `options` | array | Poll options, each with `id` and `text`. |
-| `vote` | object | First decoded vote update, with `option_id`, `participant`, and `event_type` when present. |
-| `votes` | array | All decoded vote entries when the payload carries more than one. |
+| `vote` | object | First decoded vote entry for compatibility. This is not necessarily the option that changed. |
+| `votes` | array | Authoritative full selected-option snapshot carried by the update payload. |
 | `original_guid` | string | For vote rows, the original poll message GUID from `associated_message_guid`. |
 | `creator` | string | Creator handle when the payload includes it. Creation rows may fall back to the sender handle. |
 | `participants` | array | Handles seen in decoded poll metadata. |
@@ -178,10 +184,10 @@ Inside the `attachments` array on a message:
 | `transfer_name` | string | Original filename as sent. |
 | `uti` | string | Apple UTI. |
 | `mime_type` | string | Best-effort MIME. |
-| `byte_size` | int | Size in bytes. |
+| `total_bytes` | int | Size in bytes. |
 | `is_sticker` | bool | Sticker-pack attachments. |
 | `missing` | bool | Underlying file not on disk. |
-| `path` | string | Resolved absolute path. |
+| `original_path` | string | Resolved absolute path. |
 | `converted_path` | string | Present with `--convert-attachments`. |
 | `converted_mime_type` | string | Present with `--convert-attachments`. |
 
@@ -205,7 +211,7 @@ See [Statistics](stats.md) for filtering, ordering, and timezone behavior.
 
 ## Conventions
 
-- Every numeric field is a JSON number. `id`, `chat_id`, and `byte_size` are integers; nothing requires 64-bit JSON-string encoding.
+- Every numeric field is a JSON number. `id`, `chat_id`, and `total_bytes` are integers; nothing requires 64-bit JSON-string encoding.
 - Times are ISO 8601 with explicit timezone (typically `Z`).
 - Strings that aren't applicable are omitted, not set to `null`. Test with `field in obj`, not `obj.field === null`.
 - Booleans are explicit `true` / `false`, never 0/1.

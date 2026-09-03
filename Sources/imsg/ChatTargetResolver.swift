@@ -97,6 +97,27 @@ enum ChatTargetResolver {
     return candidates
   }
 
+  static func existingDirectChat(
+    store: MessageStore,
+    recipient: String,
+    service: MessageService,
+    includeAnyForSMS: Bool = false
+  ) throws -> ChatInfo? {
+    let trimmed = recipient.trimmingCharacters(in: .whitespacesAndNewlines)
+    var candidates = directChatCandidates(recipient: recipient, service: service)
+    if includeAnyForSMS, !trimmed.isEmpty {
+      candidates = ["SMS;-;\(trimmed)", "any;-;\(trimmed)", "any;+;\(trimmed)"]
+    }
+    for candidate in candidates {
+      let info =
+        includeAnyForSMS
+        ? try store.chatInfo(matchingExactTarget: candidate)
+        : try store.chatInfo(matchingTarget: candidate)
+      if let info { return info }
+    }
+    return nil
+  }
+
   static func looksLikeContactName(_ recipient: String) -> Bool {
     let trimmed = recipient.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty { return false }
@@ -109,11 +130,33 @@ enum ChatTargetResolver {
     return true
   }
 
+  static func directParticipantTarget(
+    store: MessageStore?,
+    resolvedTarget: ResolvedChatTarget,
+    directChatInfo: ChatInfo?
+  ) -> DirectParticipantTarget? {
+    guard let store else { return nil }
+    let chat =
+      directChatInfo
+      ?? resolvedTarget.preferredIdentifier.flatMap {
+        try? store.chatInfo(matchingExactTarget: $0)
+      }
+    guard let chat, let participants = try? store.participants(chatID: chat.id) else {
+      return nil
+    }
+    return DirectParticipantTarget(chat: chat, participants: participants)
+  }
+
   static func resolveRecipientName(
     _ recipient: String,
     contacts: any ContactResolving
   ) throws -> String {
     guard looksLikeContactName(recipient) else { return recipient }
+    guard !contacts.contactsUnavailable else {
+      throw IMsgError.invalidChatTarget(
+        "Contacts access is unavailable; specify a phone number or email instead."
+      )
+    }
     let matches = contacts.searchByName(recipient)
     switch matches.count {
     case 0:

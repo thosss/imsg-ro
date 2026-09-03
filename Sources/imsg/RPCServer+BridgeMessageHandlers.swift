@@ -1,83 +1,120 @@
-import CoreFoundation
 import Foundation
 import IMsgCore
 
 extension RPCServer {
   func handleSendRich(params: [String: Any], id: Any?) async throws {
-    let retiredRichLinkKeys = ["link", "rich_link", "richLink", "rich_link_url"]
-    if let key = retiredRichLinkKeys.first(where: { params.keys.contains($0) }) {
-      throw RPCError.invalidParams("\(key) is not supported; pass url without rich-link modifiers")
-    }
-    if params.keys.contains("url") {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.replyTarget,
+      RPCParameterKeys.partIndex,
+      [
+        "text", "message", "file", "path", "url", "dd_scan", "ddScan", "effect_id",
+        "effectId", "effect", "subject", "text_formatting", "textFormatting",
+      ]
+    )
+    let params = try RPCParameters(params, method: "send.rich", supportedKeys: supportedKeys)
+    if params.contains("url") {
       try await handleSendRichLink(params: params, id: id)
       return
     }
+    let text = try params.string("text", aliases: ["message"]) ?? ""
+    let file = try params.string("file", aliases: ["path"]) ?? ""
+    if params.contains("file") || params.contains("path") {
+      guard !file.isEmpty else {
+        throw RPCError.invalidParams("file must be a non-empty string")
+      }
+    }
+    let partIndex = try params.integer("part_index", aliases: ["partIndex"]) ?? 0
+    let ddScan = try params.boolean("dd_scan", aliases: ["ddScan"]) ?? true
+    let effect = try params.string("effect_id", aliases: ["effectId", "effect"])
+    let subject = try params.string("subject")
+    let reply = try params.string(
+      "reply_to", aliases: ["replyTo", "reply_to_guid", "message_guid"])
+    let formatting = try params.objectArray("text_formatting", aliases: ["textFormatting"])
     let chatGUID = try await resolveChatGUIDParam(params)
-    let text = stringParam(params["text"]) ?? stringParam(params["message"]) ?? ""
     var bridgeParams: [String: Any] = [
       "chatGuid": chatGUID,
       "message": text,
-      "partIndex": intParam(params["part_index"] ?? params["partIndex"]) ?? 0,
-      "ddScan": boolParam(params["dd_scan"] ?? params["ddScan"]) ?? true,
+      "partIndex": partIndex,
+      "ddScan": ddScan,
     ]
-    if let effect = stringParam(params["effect_id"] ?? params["effectId"] ?? params["effect"]),
-      !effect.isEmpty
-    {
+    if let effect, !effect.isEmpty {
       bridgeParams["effectId"] = ExpressiveSendEffect.expand(effect)
     }
-    if let subject = stringParam(params["subject"]), !subject.isEmpty {
+    if let subject, !subject.isEmpty {
       bridgeParams["subject"] = subject
     }
-    if let reply = stringParam(
-      params["reply_to"] ?? params["replyTo"] ?? params["reply_to_guid"] ?? params["message_guid"]
-    ), !reply.isEmpty {
+    if let reply, !reply.isEmpty {
       bridgeParams["selectedMessageGuid"] = reply
     }
-    if let formatting = params["text_formatting"] ?? params["textFormatting"] {
+    if let formatting {
       bridgeParams["textFormatting"] = formatting
     }
 
-    let sentAt = Date()
-    let data = try await invokeBridge(action: .sendMessage, params: bridgeParams)
-    var result: [String: Any] = ["ok": true]
-    if let queued = data["queued"] as? Bool {
-      result["queued"] = queued
+    if file.isEmpty {
+      let sentAt = Date()
+      let data = try await invokeBridge(action: .sendMessage, params: bridgeParams)
+      let database = await databaseResources.available()
+      let chatInfo = try bridgeResponseChatInfo(
+        params: params, chatGUID: chatGUID, database: database)
+      var result = await SendRichCommand.enrichedSentMessageResponse(
+        data,
+        chat: chatGUID,
+        text: text,
+        sentAt: sentAt,
+        store: database?.store,
+        chatInfo: chatInfo,
+        resolveSentMessage: resolveSentMessage
+      )
+      result["ok"] = true
+      respond(id: id, result: result)
+      return
     }
-    let chatID =
-      int64Param(params["chat_id"])
-      ?? (try? store.chatInfo(matchingTarget: chatGUID)?.id)
-    let options = MessageSendOptions(
-      recipient: "",
-      text: text,
-      service: .auto,
-      chatGUID: chatGUID
+
+    let verification = try await bridgeSendVerificationBaseline()
+    try await requireRichAttachmentCapability(
+      requiresMetadata: !text.isEmpty || effect?.isEmpty == false || subject?.isEmpty == false
+        || reply?.isEmpty == false || partIndex != 0 || formatting != nil
     )
-    if data["queued"] as? Bool == true,
-      !text.isEmpty,
-      let sentMessage = try? await resolveSentMessage(store, options, chatID, sentAt),
-      !sentMessage.guid.isEmpty
-    {
-      result["guid"] = sentMessage.guid
-      result["message_id"] = sentMessage.guid
-    } else if data["queued"] as? Bool != true,
-      let guid = data["messageGuid"] as? String, !guid.isEmpty
-    {
-      result["guid"] = guid
-      result["message_id"] = guid
+    do {
+      bridgeParams["filePath"] = try stageAttachment((file as NSString).expandingTildeInPath)
+    } catch {
+      throw DeliveryFailure(
+        disposition: .notStarted,
+        transport: .bridgeV2,
+        operation: BridgeAction.sendAttachment.rawValue,
+        detail: "The attachment could not be staged before bridge dispatch."
+      )
     }
+    bridgeParams["isAudioMessage"] = false
+    let data = try await invokeBridge(action: .sendAttachment, params: bridgeParams)
+    var result = try await verifiedBridgeSendResponse(
+      data,
+      params: params,
+      chatGUID: chatGUID,
+      action: .sendAttachment,
+      database: verification.database,
+      baselineRowID: verification.rowID
+    )
+    result["ok"] = true
     respond(id: id, result: result)
   }
 
-  private func handleSendRichLink(params: [String: Any], id: Any?) async throws {
-    let allowedKeys: Set<String> = ["chat_id", "chat_identifier", "chat_guid", "url"]
-    if let unsupported = params.keys.sorted().first(where: { !allowedKeys.contains($0) }) {
+  private func handleSendRichLink(params: RPCParameters, id: Any?) async throws {
+    let incompatibleKeys = [
+      "text", "message", "dd_scan", "ddScan", "effect_id", "effectId", "effect", "subject",
+      "reply_to", "replyTo", "reply_to_guid", "message_guid", "part_index", "partIndex",
+      "text_formatting", "textFormatting", "file", "path",
+    ]
+    if let unsupported = incompatibleKeys.first(where: params.contains) {
       throw RPCError.invalidParams("\(unsupported) is not supported with url")
     }
-    guard let rawURL = params["url"] as? String else {
-      throw RPCError.invalidParams("url must be a string")
+    guard let rawURL = try params.string("url") else {
+      throw RPCError.invalidParams("url is required")
     }
 
-    let chatInfo = try await strictRichLinkChatInfo(params)
+    let database = try await databaseResources.require()
+    let chatInfo = try await strictRichLinkChatInfo(params, database: database)
     let chatGUID = chatInfo.guid
     let status = try await invokeBridge(action: .status, params: [:])
     guard bridgeSupportsRichLinks(status) else {
@@ -110,122 +147,105 @@ extension RPCServer {
     } catch {
       throw error
     }
-    var result: [String: Any] = ["ok": true]
-    if let queued = data["queued"] as? Bool {
-      result["queued"] = queued
-    }
-    let options = MessageSendOptions(
-      recipient: "",
+    var result = await SendRichCommand.enrichedSentMessageResponse(
+      data,
+      chat: chatGUID,
       text: prepared.originalURL,
-      service: .imessage,
-      chatGUID: chatGUID
+      sentAt: sentAt,
+      store: database.store,
+      chatInfo: chatInfo,
+      resolveSentMessage: resolveSentMessage
     )
-    if data["queued"] as? Bool == true,
-      let sentMessage = try? await resolveSentMessage(store, options, chatInfo.id, sentAt),
-      !sentMessage.guid.isEmpty
-    {
-      result["guid"] = sentMessage.guid
-      result["message_id"] = sentMessage.guid
-    } else if data["queued"] as? Bool != true,
-      let guid = data["messageGuid"] as? String, !guid.isEmpty
-    {
-      result["guid"] = guid
-      result["message_id"] = guid
-    }
+    result["ok"] = true
     respond(id: id, result: result)
   }
 
-  private func strictRichLinkChatInfo(_ params: [String: Any]) async throws -> ChatInfo {
-    let targetKeys = ["chat_id", "chat_identifier", "chat_guid"]
-    let supplied = targetKeys.filter { params.keys.contains($0) }
-    guard supplied.count == 1, let key = supplied.first else {
-      throw RPCError.invalidParams(
-        "exactly one of chat_id, chat_identifier, or chat_guid is required")
-    }
-
-    let info: ChatInfo?
-    switch key {
-    case "chat_id":
-      guard
-        let number = params[key] as? NSNumber,
-        CFGetTypeID(number) != CFBooleanGetTypeID(),
-        !["f", "d", "D"].contains(String(cString: number.objCType)),
-        let chatID = Int64(number.stringValue),
-        chatID > 0
-      else {
-        throw RPCError.invalidParams("chat_id must be a positive integer")
-      }
-      info = try await cache.info(chatID: chatID)
-    case "chat_identifier", "chat_guid":
-      guard let target = params[key] as? String, !target.isEmpty else {
-        throw RPCError.invalidParams("\(key) must be a non-empty string")
-      }
-      if key == "chat_identifier" {
-        info = try store.chatInfo(
-          matchingExactIdentifier: target,
-          preferredServices: ["iMessage", "iMessageLite"]
-        )
-      } else {
-        info = try store.chatInfo(matchingExactGUID: target)
-      }
-    default:
-      info = nil
-    }
-
-    guard let info, !info.guid.isEmpty else {
-      throw RPCError.invalidParams("rich links require an existing chat")
-    }
-    let service = info.service.lowercased()
-    guard service == "imessage" || service == "imessagelite" else {
-      throw RPCError.invalidParams("rich links require an iMessage chat")
-    }
-    return info
-  }
-
   func handleSendAttachment(params: [String: Any], id: Any?) async throws {
-    let chatGUID = try await resolveChatGUIDParam(params)
-    guard let file = stringParam(params["file"] ?? params["path"]), !file.isEmpty else {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.replyTarget,
+      RPCParameterKeys.partIndex,
+      ["file", "path", "audio", "is_audio", "as_voice"]
+    )
+    let params = try RPCParameters(
+      params, method: "send.attachment", supportedKeys: supportedKeys)
+    guard let file = try params.string("file", aliases: ["path"]), !file.isEmpty else {
       throw RPCError.invalidParams("file is required")
     }
+    let audio = try params.boolean("audio", aliases: ["is_audio", "as_voice"]) ?? false
+    let reply = try params.string(
+      "reply_to", aliases: ["replyTo", "reply_to_guid", "message_guid"])
+    let partIndex = try params.integer("part_index", aliases: ["partIndex"])
+    if let partIndex {
+      guard partIndex >= 0 else {
+        throw RPCError.invalidParams("part_index must be a non-negative integer")
+      }
+      guard reply?.isEmpty == false else {
+        throw RPCError.invalidParams("part_index requires reply_to")
+      }
+    }
+    let chatGUID = try await resolveChatGUIDParam(params)
     var bridgeParams: [String: Any] = [
       "chatGuid": chatGUID,
       "filePath": try stageAttachment((file as NSString).expandingTildeInPath),
-      "isAudioMessage": boolParam(params["audio"] ?? params["is_audio"] ?? params["as_voice"])
-        ?? false,
+      "isAudioMessage": audio,
     ]
-    if let reply = stringParam(
-      params["reply_to"] ?? params["replyTo"] ?? params["reply_to_guid"] ?? params["message_guid"]
-    ), !reply.isEmpty {
+    if let reply, !reply.isEmpty {
       bridgeParams["selectedMessageGuid"] = reply
     }
-    let data = try await invokeBridge(action: .sendAttachment, params: bridgeParams)
-    var result: [String: Any] = ["ok": true]
-    if let guid = data["messageGuid"] as? String, !guid.isEmpty {
-      result["guid"] = guid
-      result["message_id"] = guid
+    if let partIndex {
+      bridgeParams["partIndex"] = partIndex
     }
+    let data = try await invokeBridge(action: .sendAttachment, params: bridgeParams)
+    let database = await databaseResources.available()
+    let chatInfo = try bridgeResponseChatInfo(
+      params: params, chatGUID: chatGUID, database: database)
+    var result = await SendRichCommand.enrichedSentMessageResponse(
+      data,
+      chat: chatGUID,
+      text: "",
+      sentAt: Date(),
+      store: database?.store,
+      chatInfo: chatInfo,
+      resolveSentMessage: resolveSentMessage
+    )
+    result["ok"] = true
     respond(id: id, result: result)
   }
 
   func handlePollSend(params: [String: Any], id: Any?) async throws {
-    let chatGUID = try await resolveChatGUIDParam(params)
-    guard let question = stringParam(params["question"]), !question.isEmpty else {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.replyTarget,
+      [
+        "question", "options", "option", "creator_handle", "creatorHandle", "comment",
+        "suppress_comment", "suppressComment",
+      ]
+    )
+    let params = try RPCParameters(params, method: "poll.send", supportedKeys: supportedKeys)
+    guard let question = try params.string("question"), !question.isEmpty else {
       throw RPCError.invalidParams("question is required")
     }
     let options = try rpcPollOptionsParam(params)
+    let creatorHandle = try params.string("creator_handle", aliases: ["creatorHandle"])
+    let reply = try params.string(
+      "reply_to", aliases: ["replyTo", "reply_to_guid", "message_guid"])
+    let commentValue = try params.string("comment")
+    let suppressComment =
+      try params.boolean("suppress_comment", aliases: ["suppressComment"]) ?? false
+    if commentValue != nil, suppressComment {
+      throw RPCError.invalidParams("comment cannot be combined with suppress_comment: true")
+    }
+    let chatGUID = try await resolveChatGUIDParam(params)
     var bridgeParams: [String: Any] = [
       "chatGuid": chatGUID,
       "question": question,
       "options": options,
     ]
-    if let creatorHandle = stringParam(params["creator_handle"] ?? params["creatorHandle"]),
-      !creatorHandle.isEmpty
-    {
+    if let creatorHandle, !creatorHandle.isEmpty {
       bridgeParams["creatorHandle"] = creatorHandle
     }
-    if let reply = stringParam(
-      params["reply_to"] ?? params["replyTo"] ?? params["reply_to_guid"] ?? params["message_guid"]
-    ), !reply.isEmpty {
+    if let reply, !reply.isEmpty {
       bridgeParams["selectedMessageGuid"] = reply
     }
 
@@ -251,8 +271,9 @@ extension RPCServer {
     // Callers pass only `question`; the caption appears for free and the agent
     // needs no knowledge of this. Best-effort: the poll already succeeded, so a
     // comment failure must not fail the RPC.
-    let comment = stringParam(params["comment"]).flatMap { $0.isEmpty ? nil : $0 } ?? question
-    if !comment.isEmpty {
+    let comment = commentValue.flatMap { $0.isEmpty ? nil : $0 } ?? question
+    var poisonAfterResponse: DeliveryFailure?
+    if !suppressComment, !comment.isEmpty {
       do {
         _ = try await invokeBridge(
           action: .sendMessage,
@@ -260,6 +281,14 @@ extension RPCServer {
             "chatGuid": chatGUID,
             "message": comment,
           ])
+      } catch let failure as DeliveryFailure {
+        if failure.disposition == .stillInFlight {
+          poisonAfterResponse = failure
+        }
+        let pollGuid = (data["messageGuid"] as? String) ?? ""
+        let pollDescription = pollGuid.isEmpty ? "queued poll" : "poll \(pollGuid)"
+        FileHandle.standardError.write(
+          Data("[imsg] poll.send: comment echo delivery unresolved for \(pollDescription)\n".utf8))
       } catch {
         let pollGuid = (data["messageGuid"] as? String) ?? ""
         let pollDescription = pollGuid.isEmpty ? "queued poll" : "poll \(pollGuid)"
@@ -268,41 +297,95 @@ extension RPCServer {
       }
     }
     respond(id: id, result: result)
+    if let poisonAfterResponse {
+      throw RPCMutationPoisonSignal(failure: poisonAfterResponse)
+    }
   }
 
   func handlePollVote(params: [String: Any], id: Any?) async throws {
-    try await handlePollVoteMutation(params: params, id: id, remove: false)
+    try await handlePollVoteMutation(
+      params: params, id: id, remove: false, method: "poll.vote")
   }
 
   func handlePollUnvote(params: [String: Any], id: Any?) async throws {
-    try await handlePollVoteMutation(params: params, id: id, remove: true)
+    try await handlePollVoteMutation(
+      params: params, id: id, remove: true, method: "poll.unvote")
   }
 
-  private func handlePollVoteMutation(params: [String: Any], id: Any?, remove: Bool) async throws {
-    let chatGUID = try await resolveChatGUIDParam(params)
+  private func handlePollVoteMutation(
+    params rawParams: [String: Any],
+    id: Any?,
+    remove: Bool,
+    method: String
+  ) async throws {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      [
+        "poll_guid", "pollGuid", "poll_message_guid", "message_guid", "message_id",
+        "option_id", "optionId", "optionIdentifier", "option_index", "optionIndex", "option",
+      ]
+    )
+    let params = try RPCParameters(rawParams, method: method, supportedKeys: supportedKeys)
     guard
-      let pollGUID = stringParam(
-        params["poll_guid"] ?? params["pollGuid"] ?? params["poll_message_guid"]
-          ?? params["message_guid"] ?? params["message_id"]), !pollGUID.isEmpty
+      let pollGUID = try params.string(
+        "poll_guid",
+        aliases: ["pollGuid", "poll_message_guid", "message_guid", "message_id"]),
+      !pollGUID.isEmpty
     else {
       throw RPCError.invalidParams("poll_guid is required")
     }
-    guard
-      let optionID = stringParam(
-        params["option_id"] ?? params["optionId"] ?? params["optionIdentifier"]),
-      !optionID.isEmpty
-    else {
-      throw RPCError.invalidParams("option_id is required")
+    let directOptionID = try params.string(
+      "option_id", aliases: ["optionId", "optionIdentifier"]
+    )?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let optionIndex = try params.integer("option_index", aliases: ["optionIndex"])
+    let optionText = try params.string("option")?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let selectors = [
+      directOptionID?.isEmpty == false,
+      optionIndex != nil,
+      optionText?.isEmpty == false,
+    ]
+    guard selectors.contains(true) else {
+      throw RPCError.invalidParams("one of option_id, option_index, or option is required")
     }
-    // Validate the poll exists and the option belongs to it (mirrors the CLI),
-    // so an API caller can't cast a vote against an arbitrary non-poll GUID.
-    let pollOptions = try store.pollOptions(guid: pollGUID)
+    guard selectors.filter({ $0 }).count == 1 else {
+      throw RPCError.invalidParams("choose exactly one of option_id, option_index, or option")
+    }
+    // Resolve every selector against decoded options, so callers cannot vote
+    // against an arbitrary non-poll GUID or supply caller-trusted option text.
+    let database = try await databaseResources.require()
+    let chatGUID = try await resolveChatGUIDParam(params)
+    let pollOptions = try database.store.pollOptions(guid: pollGUID)
     guard !pollOptions.isEmpty else {
       throw RPCError.invalidParams("poll \(pollGUID) not found or not decodable")
     }
-    guard let matchedOption = pollOptions.first(where: { $0.id == optionID }) else {
-      throw RPCError.invalidParams("option_id \(optionID) is not an option of poll \(pollGUID)")
+
+    let matchedOption: MessagePollOption
+    if let directOptionID, !directOptionID.isEmpty {
+      guard let option = pollOptions.first(where: { $0.id == directOptionID }) else {
+        throw RPCError.invalidParams(
+          "option_id \(directOptionID) is not an option of poll \(pollGUID)")
+      }
+      matchedOption = option
+    } else if let optionIndex {
+      guard optionIndex >= 1, optionIndex <= pollOptions.count else {
+        throw RPCError.invalidParams(
+          "option_index \(optionIndex) out of range (1...\(pollOptions.count))")
+      }
+      matchedOption = pollOptions[optionIndex - 1]
+    } else {
+      let text = optionText ?? ""
+      guard
+        let option = pollOptions.first(where: {
+          $0.text.caseInsensitiveCompare(text) == .orderedSame
+        })
+      else {
+        let available = pollOptions.map(\.text).joined(separator: ", ")
+        throw RPCError.invalidParams("option \"\(text)\" (available: \(available))")
+      }
+      matchedOption = option
     }
+    let optionID = matchedOption.id
     var bridgeParams: [String: Any] = [
       "chatGuid": chatGUID,
       // Native votes associate to the bare poll GUID (strip a leading p:<part>/).
@@ -313,7 +396,7 @@ extension RPCServer {
       bridgeParams["optionText"] = matchedOption.text
     }
     if remove {
-      let selectedOptionIDs = try store.pollSelectedOptionIDs(guid: pollGUID)
+      let selectedOptionIDs = try database.store.pollSelectedOptionIDs(guid: pollGUID)
       guard selectedOptionIDs.contains(optionID) else {
         throw RPCError.invalidParams("option_id \(optionID) is not currently selected")
       }
@@ -343,14 +426,23 @@ extension RPCServer {
   }
 
   func handleTapback(params: [String: Any], id: Any?) async throws {
-    let chatGUID = try await resolveChatGUIDParam(params)
-    guard let messageGUID = rpcMessageGUIDParam(params) else {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.messageTarget,
+      RPCParameterKeys.partIndex,
+      ["reaction", "kind", "emoji", "remove"]
+    )
+    let params = try RPCParameters(params, method: "tapback", supportedKeys: supportedKeys)
+    guard let messageGUID = try rpcMessageGUIDParam(params) else {
       throw RPCError.invalidParams("message_id or message_guid is required")
     }
-    let rawReaction = stringParam(params["reaction"] ?? params["kind"] ?? params["emoji"]) ?? ""
+    let rawReaction = try params.string("reaction", aliases: ["kind", "emoji"]) ?? ""
+    let remove = try params.boolean("remove") ?? false
+    let partIndex = try params.integer("part_index", aliases: ["partIndex"]) ?? 0
+    let chatGUID = try await resolveChatGUIDParam(params)
     let reactionType = try normalizeBridgeReactionType(
       rawReaction,
-      remove: boolParam(params["remove"]) ?? false
+      remove: remove
     )
     _ = try await invokeBridge(
       action: .sendReaction,
@@ -358,34 +450,48 @@ extension RPCServer {
         "chatGuid": chatGUID,
         "selectedMessageGuid": messageGUID,
         "reactionType": reactionType,
-        "partIndex": intParam(params["part_index"] ?? params["partIndex"]) ?? 0,
+        "partIndex": partIndex,
       ]
     )
     respond(id: id, result: ["ok": true, "reaction": reactionType])
   }
 
   func handleMessageEdit(params: [String: Any], id: Any?) async throws {
-    let chatGUID = try await resolveChatGUIDParam(params)
-    guard let messageGUID = rpcMessageGUIDParam(params) else {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.messageTarget,
+      RPCParameterKeys.partIndex,
+      [
+        "text", "new_text", "newText", "edited_message", "backwards_compatibility_message",
+        "backwardsCompatibilityMessage", "bc_text", "bcText",
+      ]
+    )
+    let params = try RPCParameters(params, method: "message.edit", supportedKeys: supportedKeys)
+    guard let messageGUID = try rpcMessageGUIDParam(params) else {
       throw RPCError.invalidParams("message_id or message_guid is required")
     }
     guard
-      let text = stringParam(
-        params["text"] ?? params["new_text"] ?? params["newText"] ?? params["edited_message"]
-      ), !text.isEmpty
+      let text = try params.string(
+        "text", aliases: ["new_text", "newText", "edited_message"]),
+      !text.isEmpty
     else {
       throw RPCError.invalidParams("text is required")
     }
+    let compatibilityText =
+      try params.string(
+        "backwards_compatibility_message",
+        aliases: ["backwardsCompatibilityMessage", "bc_text", "bcText"]
+      ) ?? text
+    let partIndex = try params.integer("part_index", aliases: ["partIndex"]) ?? 0
+    let chatGUID = try await resolveChatGUIDParam(params)
     _ = try await invokeBridge(
       action: .editMessage,
       params: [
         "chatGuid": chatGUID,
         "messageGuid": messageGUID,
         "editedMessage": text,
-        "backwardsCompatibilityMessage": stringParam(
-          params["backwards_compatibility_message"] ?? params["backwardsCompatibilityMessage"]
-            ?? params["bc_text"] ?? params["bcText"]) ?? text,
-        "partIndex": intParam(params["part_index"] ?? params["partIndex"]) ?? 0,
+        "backwardsCompatibilityMessage": compatibilityText,
+        "partIndex": partIndex,
       ]
     )
     respond(id: id, result: ["ok": true])
@@ -396,19 +502,27 @@ extension RPCServer {
       action: .unsendMessage,
       params: params,
       id: id,
-      includePartIndex: true
+      includePartIndex: true,
+      method: "message.unsend"
     )
   }
 
   func handleMessageDelete(params: [String: Any], id: Any?) async throws {
-    try await invokeMessageGUIDBridgeAction(action: .deleteMessage, params: params, id: id)
+    try await invokeMessageGUIDBridgeAction(
+      action: .deleteMessage, params: params, id: id, method: "message.delete")
   }
 
   func handleMessageNotifyAnyways(params: [String: Any], id: Any?) async throws {
-    try await invokeMessageGUIDBridgeAction(action: .notifyAnyways, params: params, id: id)
+    try await invokeMessageGUIDBridgeAction(
+      action: .notifyAnyways, params: params, id: id, method: "message.notifyAnyways")
   }
 
   func handleNamePhotoStatus(params: [String: Any], id: Any?) async throws {
+    let params = try RPCParameters(
+      params,
+      method: "contacts.shouldShareContact",
+      supportedKeys: RPCParameterKeys.chatTarget
+    )
     let chatGUID = try await resolveChatGUIDParam(params)
     let data = try await invokeBridge(
       action: .shouldOfferNicknameSharing,
@@ -418,6 +532,11 @@ extension RPCServer {
   }
 
   func handleNamePhotoShare(params: [String: Any], id: Any?) async throws {
+    let params = try RPCParameters(
+      params,
+      method: "contacts.shareContactCard",
+      supportedKeys: RPCParameterKeys.chatTarget
+    )
     let chatGUID = try await resolveChatGUIDParam(params)
     let data = try await invokeBridge(action: .shareNickname, params: ["chatGuid": chatGUID])
     respond(id: id, result: data.merging(["ok": true]) { current, _ in current })
@@ -427,87 +546,29 @@ extension RPCServer {
     action: BridgeAction,
     params: [String: Any],
     id: Any?,
-    includePartIndex: Bool = false
+    includePartIndex: Bool = false,
+    method: String
   ) async throws {
-    let chatGUID = try await resolveChatGUIDParam(params)
-    guard let messageGUID = rpcMessageGUIDParam(params) else {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.messageTarget,
+      includePartIndex ? RPCParameterKeys.partIndex : []
+    )
+    let params = try RPCParameters(params, method: method, supportedKeys: supportedKeys)
+    guard let messageGUID = try rpcMessageGUIDParam(params) else {
       throw RPCError.invalidParams("message_id or message_guid is required")
     }
+    let partIndex =
+      includePartIndex ? (try params.integer("part_index", aliases: ["partIndex"]) ?? 0) : nil
+    let chatGUID = try await resolveChatGUIDParam(params)
     var bridgeParams: [String: Any] = [
       "chatGuid": chatGUID,
       "messageGuid": messageGUID,
     ]
-    if includePartIndex {
-      bridgeParams["partIndex"] = intParam(params["part_index"] ?? params["partIndex"]) ?? 0
+    if let partIndex {
+      bridgeParams["partIndex"] = partIndex
     }
     _ = try await invokeBridge(action: action, params: bridgeParams)
     respond(id: id, result: ["ok": true])
   }
-}
-
-func rpcPollOptionsParam(_ params: [String: Any]) throws -> [String] {
-  let raw = params["options"] ?? params["option"]
-  let values: [Any]
-  if let array = raw as? [Any] {
-    values = array
-  } else if let string = raw as? String {
-    values = [string]
-  } else {
-    throw RPCError.invalidParams("options is required")
-  }
-
-  let options = values.compactMap { value -> String? in
-    guard let string = stringParam(value) else { return nil }
-    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? nil : trimmed
-  }
-  if options.count < 2 {
-    throw RPCError.invalidParams("at least two poll options are required")
-  }
-  return options
-}
-
-func rpcMessageGUIDParam(_ params: [String: Any]) -> String? {
-  let raw = stringParam(
-    params["message_id"] ?? params["messageId"] ?? params["message_guid"] ?? params["messageGuid"]
-      ?? params["message"]
-  )
-  let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-  return trimmed.isEmpty ? nil : trimmed
-}
-
-func normalizeBridgeReactionType(_ raw: String, remove: Bool = false) throws -> String {
-  var value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-  if value.isEmpty {
-    throw RPCError.invalidParams("reaction, kind, or emoji is required")
-  }
-  var shouldRemove = remove
-  if value.hasPrefix("remove-") {
-    shouldRemove = true
-    value.removeFirst("remove-".count)
-  }
-  let normalized: String
-  switch value {
-  case "love", "heart", "❤️", "❤":
-    normalized = "love"
-  case "like", "thumbsup", "thumbs-up", "+1", "👍":
-    normalized = "like"
-  case "dislike", "thumbsdown", "thumbs-down", "-1", "👎":
-    normalized = "dislike"
-  case "laugh", "haha", "lol", "😂", "🤣":
-    normalized = "laugh"
-  case "emphasize", "emphasis", "!!", "‼", "‼️":
-    normalized = "emphasize"
-  case "question", "?", "❓":
-    normalized = "question"
-  default:
-    throw RPCError.invalidParams(
-      "unsupported tapback reaction \(raw); use love, like, dislike, laugh, emphasize, or question"
-    )
-  }
-  let result = shouldRemove ? "remove-\(normalized)" : normalized
-  guard BridgeReactionKind(rawValue: result) != nil else {
-    throw RPCError.invalidParams("unsupported tapback reaction \(raw)")
-  }
-  return result
 }

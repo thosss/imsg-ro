@@ -5,36 +5,6 @@ import Testing
 @testable import IMsgCore
 @testable import imsg
 
-final class TestRPCOutput: RPCOutput, @unchecked Sendable {
-  private let lock = NSLock()
-  private(set) var responses: [[String: Any]] = []
-  private(set) var errors: [[String: Any]] = []
-  private(set) var notifications: [[String: Any]] = []
-
-  func sendResponse(id: Any, result: Any) {
-    record(&responses, value: ["jsonrpc": "2.0", "id": id, "result": result])
-  }
-
-  func sendError(id: Any?, error: RPCError) {
-    let payload: [String: Any] = [
-      "jsonrpc": "2.0",
-      "id": id ?? NSNull(),
-      "error": error.asDictionary(),
-    ]
-    record(&errors, value: payload)
-  }
-
-  func sendNotification(method: String, params: Any) {
-    record(&notifications, value: ["jsonrpc": "2.0", "method": method, "params": params])
-  }
-
-  private func record(_ bucket: inout [[String: Any]], value: [String: Any]) {
-    lock.lock()
-    defer { lock.unlock() }
-    bucket.append(value)
-  }
-}
-
 private func int64Value(_ value: Any?) -> Int64? {
   if let value = value as? Int64 { return value }
   if let value = value as? Int { return Int64(value) }
@@ -57,7 +27,15 @@ func rpcChatsListReturnsChatPayload() async throws {
   let chats = result?["chats"] as? [[String: Any]] ?? []
   #expect(chats.count == 1)
   let chat = chats[0]
+  #expect(
+    Set(chat.keys) == [
+      "id", "name", "identifier", "service", "last_message_at", "guid", "display_name",
+      "is_group", "participants", "account_id", "account_login", "last_addressed_handle",
+    ])
   #expect(int64Value(chat["id"]) == 1)
+  #expect(chat["name"] as? String == "Group Chat")
+  #expect(chat["display_name"] as? String == "Group Chat")
+  #expect(chat["guid"] as? String == "iMessage;+;chat123")
   #expect(chat["identifier"] as? String == "iMessage;+;chat123")
   #expect(chat["is_group"] as? Bool == true)
   #expect(chat["contact_name"] == nil)
@@ -101,17 +79,18 @@ func rpcChatsCreateForwardsBridgeIdentityFields() async throws {
         "messageGuid": "created-message-guid",
         "service": "iMessage",
       ]
-    }
+    },
+    isBridgeReady: { true }
   )
 
   let line =
     #"{"jsonrpc":"2.0","id":"create","method":"chats.create","params":{"#
-    + #""addresses":["+123","+456"],"service":"auto","name":"Group","text":"hello"}}"#
+    + #""addresses":[" +123 ","+456"],"service":"ImEsSaGe","name":"Group","text":"hello"}}"#
   await server.handleLineForTesting(line)
 
   #expect(capturedAction == .createChat)
   #expect(capturedParams["addresses"] as? [String] == ["+123", "+456"])
-  #expect(capturedParams["service"] as? String == "auto")
+  #expect(capturedParams["service"] as? String == "iMessage")
   #expect(capturedParams["displayName"] as? String == "Group")
   #expect(capturedParams["message"] as? String == "hello")
   let result = output.responses.first?["result"] as? [String: Any]
@@ -167,7 +146,7 @@ func rpcSendResolvesChatID() async throws {
     verbose: false,
     output: output,
     sendMessage: { options in captured = options },
-    resolveSentMessage: { _, _, _, _ in nil }
+    resolveSentMessage: resolvedSentMessageFixture
   )
 
   let line = #"{"jsonrpc":"2.0","id":"3","method":"send","params":{"chat_id":1,"text":"yo"}}"#
@@ -192,7 +171,7 @@ func rpcSendResolvesUniqueContactName() async throws {
     verbose: false,
     output: output,
     sendMessage: { options in captured = options },
-    resolveSentMessage: { _, _, _, _ in nil },
+    resolveSentMessage: resolvedSentMessageFixture,
     contactResolver: resolver
   )
 
@@ -220,6 +199,28 @@ func rpcSendRejectsAmbiguousContactName() async throws {
 
   let error = output.errors.first?["error"] as? [String: Any]
   #expect(int64Value(error?["code"]) == -32602)
+}
+
+@Test
+func rpcSendRejectsContactNameWhenContactsAreUnavailable() async throws {
+  let store = try CommandTestDatabase.makeStoreForRPC()
+  let output = TestRPCOutput()
+  let resolver = MockContactResolver(contactsUnavailable: true)
+  var didSend = false
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    output: output,
+    sendMessage: { _ in didSend = true },
+    contactResolver: resolver
+  )
+
+  let line = #"{"jsonrpc":"2.0","id":"3u","method":"send","params":{"to":"Alice","text":"yo"}}"#
+  await server.handleLineForTesting(line)
+
+  let error = output.errors.first?["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32602)
+  #expect(didSend == false)
 }
 
 @Test
@@ -260,7 +261,7 @@ func rpcSendReturnsSentMessageIdentifiersWhenResolved() async throws {
 }
 
 @Test
-func rpcSendKeepsOkResponseWhenSentMessageIsNotResolved() async throws {
+func rpcAttachmentOnlyKeepsOkResponseWithoutTextVerification() async throws {
   let store = try CommandTestDatabase.makeStoreForRPC()
   let output = TestRPCOutput()
   let server = RPCServer(
@@ -271,7 +272,8 @@ func rpcSendKeepsOkResponseWhenSentMessageIsNotResolved() async throws {
     resolveSentMessage: { _, _, _, _ in nil }
   )
 
-  let line = #"{"jsonrpc":"2.0","id":"3c","method":"send","params":{"chat_id":1,"text":"yo"}}"#
+  let line =
+    #"{"jsonrpc":"2.0","id":"3c","method":"send","params":{"chat_id":1,"file":"/tmp/photo.jpg"}}"#
   await server.handleLineForTesting(line)
 
   let result = output.responses.first?["result"] as? [String: Any]
@@ -309,8 +311,13 @@ func rpcSendReportsMisroutedChatGhost() async throws {
   await server.handleLineForTesting(line)
 
   let error = output.errors.first?["error"] as? [String: Any]
-  #expect(int64Value(error?["code"]) == -32603)
-  #expect((error?["data"] as? String)?.contains("unjoined empty outgoing row") == true)
+  let data = error?["data"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32001)
+  #expect(data?["retry_safe"] as? Bool == false)
+  #expect(data?["disposition"] as? String == "may_have_completed")
+  #expect(data?["transport"] as? String == "applescript")
+  #expect(data?["operation"] as? String == "send")
+  #expect((data?["detail"] as? String)?.contains("unjoined empty outgoing row (99)") == true)
 }
 
 @Test
@@ -337,30 +344,6 @@ func rpcRejectsInvalidJSON() async throws {
 
   let error = output.errors.first?["error"] as? [String: Any]
   #expect(int64Value(error?["code"]) == -32700)
-}
-
-@Test
-func rpcStartupErrorServerPreservesJSONRPCFraming() async throws {
-  let output = TestRPCOutput()
-  let error = IMsgError.permissionDenied(
-    path: "/tmp/chat.db",
-    underlying: NSError(domain: "SQLite", code: 14)
-  )
-  let server = RPCStartupErrorServer(error: error, output: output)
-
-  await server.handleLineForTesting(
-    #"{"jsonrpc":"2.0","id":"startup","method":"chats.list","params":{"limit":1}}"#
-  )
-
-  #expect(output.errors.count == 1)
-  let envelope = output.errors[0]
-  #expect(envelope["id"] as? String == "startup")
-  let payload = envelope["error"] as? [String: Any]
-  #expect(int64Value(payload?["code"]) == -32603)
-  #expect(payload?["message"] as? String == "Internal error")
-  let data = payload?["data"] as? String ?? ""
-  #expect(data.contains("Permission Error"))
-  #expect(data.contains("Full Disk Access"))
 }
 
 @Test

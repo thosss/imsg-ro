@@ -5,6 +5,11 @@ import IMsgCore
 // MARK: - search
 
 enum SearchCommand {
+  /// Same TTY rule as RPC: headless stdin must not prompt for Contacts.
+  static func contactsAccessPolicy(stdinIsTTY: Bool) -> ContactsAccessPolicy {
+    .forStdin(isTTY: stdinIsTTY)
+  }
+
   static let spec = CommandSpec(
     name: "search",
     abstract: "Search local Messages history",
@@ -31,7 +36,9 @@ enum SearchCommand {
     values: ParsedValues,
     runtime: RuntimeOptions,
     contactResolverFactory: @escaping () async -> any ContactResolving = {
-      await ContactResolver.create()
+      await ContactResolver.create(
+        accessPolicy: contactsAccessPolicy(stdinIsTTY: ContactsAccessPolicy.stdinIsTTY)
+      )
     }
   ) async throws {
     guard let q = values.option("query"), !q.isEmpty else {
@@ -51,11 +58,9 @@ enum SearchCommand {
     let contacts = await contactResolverFactory()
 
     if runtime.jsonOutput {
-      let cache = ChatCache(store: store)
       for message in messages {
-        let payload = try await buildMessagePayload(
+        let payload = try buildMessagePayload(
           store: store,
-          cache: cache,
           message: message,
           includeAttachments: false,
           includeReactions: false,
@@ -278,6 +283,11 @@ enum WhoisCommand {
 // MARK: - nickname
 
 enum NicknameCommand {
+  /// Same TTY rule as RPC: headless stdin must not prompt for Contacts.
+  static func contactsAccessPolicy(stdinIsTTY: Bool) -> ContactsAccessPolicy {
+    .forStdin(isTTY: stdinIsTTY)
+  }
+
   static let spec = CommandSpec(
     name: "nickname",
     abstract: "Show contact-card / nickname info for a handle",
@@ -315,7 +325,10 @@ enum NicknameCommand {
     values: ParsedValues,
     runtime: RuntimeOptions,
     contactResolverFactory: @escaping (String) async -> any ContactResolving = { region in
-      await ContactResolver.create(region: region)
+      await ContactResolver.create(
+        region: region,
+        accessPolicy: contactsAccessPolicy(stdinIsTTY: ContactsAccessPolicy.stdinIsTTY)
+      )
     }
   ) async throws {
     guard let addr = values.option("address"), !addr.isEmpty else {
@@ -335,8 +348,13 @@ enum NicknameCommand {
           "contacts_unavailable": contacts.contactsUnavailable,
         ])
       } else {
+        let missingName = contacts.contactsUnavailable ? "(Contacts unavailable)" : "(none)"
         StdoutWriter.writeLine(
-          "local_contact_name: \(name ?? "(none)") (source=local-addressbook)")
+          "local_contact_name: \(name ?? missingName) (source=local-addressbook)")
+        if contacts.contactsUnavailable {
+          StdoutWriter.writeLine(
+            "Check System Settings > Privacy & Security > Contacts for the app running imsg.")
+        }
       }
       return
     }

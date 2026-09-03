@@ -10,6 +10,26 @@ enum StatusCommand {
     return commands
   }
 
+  /// The `rpc_methods` capability list reported by `imsg status --json`.
+  ///
+  /// Read-only mode filters the list down to the methods that would actually
+  /// be accepted. `rpc_methods` is what capability-aware consumers dispatch
+  /// against, so advertising a mutating method that the read-only gate will
+  /// refuse would hand them a menu of calls that cannot succeed.
+  static func advertisedRPCMethods(
+    selectors: [String: Bool],
+    readOnly: Bool = false
+  ) -> [String] {
+    var methods =
+      selectors["clientMessageGuidReservation"] == true
+      ? kSupportedRPCMethods
+      : kSupportedRPCMethods.filter { $0 != "send.tracked" }
+    if readOnly {
+      methods = methods.filter { kReadOnlyRPCMethods.contains($0) }
+    }
+    return methods
+  }
+
   static let spec = CommandSpec(
     name: "status",
     abstract: "Check availability of imsg advanced features",
@@ -70,7 +90,7 @@ enum StatusCommand {
         bridgeVersion: bridgeVersion,
         v2Ready: v2Ready,
         selectors: selectors,
-        rpcMethods: kSupportedRPCMethods,
+        rpcMethods: advertisedRPCMethods(selectors: selectors, readOnly: runtime.readOnly),
         readOnly: runtime.readOnly
       )
       try JSONLines.print(payload)

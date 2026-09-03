@@ -1,23 +1,21 @@
-import CoreFoundation
 import Foundation
 import IMsgCore
 
 extension RPCServer {
   func handleMessagesScheduled(params: [String: Any], id: Any?) async throws {
-    let supportedParams: Set<String> = ["limit"]
-    if let unknown = params.keys.filter({ !supportedParams.contains($0) }).sorted().first {
-      throw RPCError.invalidParams("unknown messages.scheduled param: \(unknown)")
-    }
+    let params = try RPCParameters(
+      params, method: "messages.scheduled", supportedKeys: ["limit"])
 
     let limit: Int
-    if let value = params["limit"] {
-      guard let parsed = strictScheduledLimit(value) else {
+    if params.contains("limit") {
+      guard let parsed = try params.integer("limit"), parsed > 0 else {
         throw RPCError.invalidParams("limit must be a positive integer")
       }
       limit = parsed
     } else {
       limit = 50
     }
+    let store = try await databaseResources.require().store
 
     do {
       var messages = try store.scheduledMessages(limit: limit)
@@ -37,11 +35,4 @@ extension RPCServer {
       throw RPCError.invalidParams(error.description)
     }
   }
-}
-
-private func strictScheduledLimit(_ value: Any) -> Int? {
-  guard let number = value as? NSNumber else { return nil }
-  guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-  guard let parsed = Int(number.stringValue), parsed > 0 else { return nil }
-  return parsed
 }

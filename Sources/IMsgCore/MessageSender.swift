@@ -1,9 +1,5 @@
 import Foundation
 
-#if os(macOS)
-  import Carbon
-#endif
-
 public enum MessageService: String, Sendable, CaseIterable {
   case auto
   case imessage
@@ -19,6 +15,7 @@ public struct MessageSendOptions: Sendable {
   public var chatIdentifier: String
   public var chatGUID: String
   public var allowSMSFallback: Bool
+  public var directParticipantTarget: DirectParticipantTarget?
 
   public init(
     recipient: String,
@@ -28,7 +25,8 @@ public struct MessageSendOptions: Sendable {
     region: String = "US",
     chatIdentifier: String = "",
     chatGUID: String = "",
-    allowSMSFallback: Bool = true
+    allowSMSFallback: Bool = true,
+    directParticipantTarget: DirectParticipantTarget? = nil
   ) {
     self.recipient = recipient
     self.text = text
@@ -38,6 +36,7 @@ public struct MessageSendOptions: Sendable {
     self.chatIdentifier = chatIdentifier
     self.chatGUID = chatGUID
     self.allowSMSFallback = allowSMSFallback
+    self.directParticipantTarget = directParticipantTarget
   }
 }
 
@@ -90,8 +89,8 @@ public struct MessageSender {
       let smsFallbackEligible =
         resolved.allowSMSFallback
         && requestedService == .auto
-        && useChat == false
-        && resolved.service == .imessage
+        && ((useChat && resolved.service == .auto) || (!useChat && resolved.service == .imessage))
+        && !resolved.recipient.isEmpty
         && resolved.attachmentPath.isEmpty
         && !resolved.text.isEmpty
         && recipientIsPhoneNumber(resolved.recipient)
@@ -163,7 +162,10 @@ public struct MessageSender {
     smsFallbackEligible: Bool
   ) throws {
     let script = appleScript()
-    func arguments(forService service: MessageService) -> [String] {
+    let directTarget = resolved.directParticipantTarget.flatMap {
+      $0.chatGUID == chatTarget ? $0 : nil
+    }
+    func arguments(forService service: MessageService, forceBuddy: Bool = false) -> [String] {
       [
         resolved.recipient,
         resolved.text,
@@ -171,28 +173,30 @@ public struct MessageSender {
         resolved.attachmentPath,
         resolved.attachmentPath.isEmpty ? "0" : "1",
         chatTarget,
-        useChat ? "1" : "0",
+        useChat && !forceBuddy ? "1" : "0",
+        directTarget?.accountID ?? "",
+        directTarget?.recipient ?? "",
+        directTarget?.service.rawValue ?? "",
       ]
     }
 
     do {
       try runner(script, arguments(forService: resolved.service))
+    } catch let failure as DeliveryFailure {
+      guard smsFallbackEligible, failure.retrySafe else { throw failure }
+      try runner(script, arguments(forService: .sms, forceBuddy: true))
     } catch {
-      guard smsFallbackEligible else { throw error }
-      do {
-        try runner(script, arguments(forService: .sms))
-      } catch let smsError {
-        throw IMsgError.appleScriptFailure(
-          "iMessage send failed (\(error.localizedDescription)); "
-            + "SMS fallback also failed (\(smsError.localizedDescription))"
-        )
-      }
+      // Production runners always emit DeliveryFailure. An injected or future
+      // untyped error has no authoritative dispatch fact and is never retried.
+      throw error
     }
   }
 
   private func appleScript() -> String {
     return """
       on run argv
+          set dispatchPhase to "pre_dispatch"
+          try
           set theRecipient to item 1 of argv
           set theMessage to item 2 of argv
           set theService to item 3 of argv
@@ -200,15 +204,34 @@ public struct MessageSender {
           set useAttachment to item 5 of argv
           set chatId to item 6 of argv
           set useChat to item 7 of argv
+          set directAccountID to item 8 of argv
+          set directRecipient to item 9 of argv
+          set directService to item 10 of argv
 
           tell application "Messages"
               if useChat is "1" then
-                  set targetChat to chat id chatId
+                  -- Resolve eagerly; only this lookup may recover before dispatch.
+                  try
+                      set targetChat to get chat id chatId
+                  on error lookupMessage number lookupNumber
+                      if lookupNumber is not -1728 or directAccountID is "" then
+                          error number lookupNumber
+                      end if
+                      set targetAccount to get account id directAccountID
+                      if directService is "imessage" then
+                          if (service type of targetAccount) is not iMessage then error number -1728
+                      else
+                          if (service type of targetAccount) is not SMS then error number -1728
+                      end if
+                      set targetChat to get buddy directRecipient of targetAccount
+                  end try
                   if theMessage is not "" then
+                      set dispatchPhase to "dispatch_started"
                       send theMessage to targetChat
                   end if
                   if useAttachment is "1" then
                       set theFile to POSIX file theFilePath as alias
+                      set dispatchPhase to "dispatch_started"
                       send theFile to targetChat
                   end if
               else
@@ -220,14 +243,23 @@ public struct MessageSender {
 
                   set targetBuddy to buddy theRecipient of targetService
                   if theMessage is not "" then
+                      set dispatchPhase to "dispatch_started"
                       send theMessage to targetBuddy
                   end if
                   if useAttachment is "1" then
                       set theFile to POSIX file theFilePath as alias
+                      set dispatchPhase to "dispatch_started"
                       send theFile to targetBuddy
                   end if
               end if
           end tell
+          return "IMSG_RESULT" & tab & "ok" & tab & "completed" & tab & "0"
+          on error errorMessage number errorNumber
+          if dispatchPhase is "pre_dispatch" then
+              return "IMSG_RESULT" & tab & "failure" & tab & "not_started" & tab & errorNumber
+          end if
+          return "IMSG_RESULT" & tab & "failure" & tab & "may_have_completed" & tab & errorNumber
+          end try
       end run
       """
   }
@@ -235,14 +267,14 @@ public struct MessageSender {
   private func resolveChatTarget(_ options: inout MessageSendOptions) -> String {
     let guid = options.chatGUID.trimmingCharacters(in: .whitespacesAndNewlines)
     let identifier = options.chatIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !guid.isEmpty {
+      return guid
+    }
     if !identifier.isEmpty && looksLikeHandle(identifier) {
       if options.recipient.isEmpty {
         options.recipient = identifier
       }
       return ""
-    }
-    if !guid.isEmpty {
-      return guid
     }
     if identifier.isEmpty {
       return ""
@@ -264,34 +296,7 @@ public struct MessageSender {
 
   private static func runAppleScript(source: String, arguments: [String]) throws {
     #if os(macOS)
-      guard let script = NSAppleScript(source: source) else {
-        throw IMsgError.appleScriptFailure("Unable to compile AppleScript")
-      }
-      var errorInfo: NSDictionary?
-      let event = NSAppleEventDescriptor(
-        eventClass: AEEventClass(kASAppleScriptSuite),
-        eventID: AEEventID(kASSubroutineEvent),
-        targetDescriptor: nil,
-        returnID: AEReturnID(kAutoGenerateReturnID),
-        transactionID: AETransactionID(kAnyTransactionID)
-      )
-      event.setParam(
-        NSAppleEventDescriptor(string: "run"), forKeyword: AEKeyword(keyASSubroutineName))
-      let list = NSAppleEventDescriptor.list()
-      for (index, value) in arguments.enumerated() {
-        list.insert(NSAppleEventDescriptor(string: value), at: index + 1)
-      }
-      event.setParam(list, forKeyword: keyDirectObject)
-      script.executeAppleEvent(event, error: &errorInfo)
-      if let errorInfo {
-        if shouldFallbackToOsascript(errorInfo: errorInfo) {
-          try runOsascript(source: source, arguments: arguments)
-          return
-        }
-        let message =
-          (errorInfo[NSAppleScript.errorMessage] as? String) ?? "Unknown AppleScript error"
-        throw IMsgError.appleScriptFailure(message)
-      }
+      try AppleScriptSendTransport.run(source: source, arguments: arguments)
     #else
       _ = source
       _ = arguments
@@ -300,43 +305,4 @@ public struct MessageSender {
     #endif
   }
 
-  private static func shouldFallbackToOsascript(errorInfo: NSDictionary) -> Bool {
-    #if os(macOS)
-      if let errorNumber = errorInfo[NSAppleScript.errorNumber] as? Int, errorNumber == -1743 {
-        return true
-      }
-      if errorInfo[NSAppleScript.errorMessage] == nil {
-        return true
-      }
-      if let message = errorInfo[NSAppleScript.errorMessage] as? String {
-        let lower = message.lowercased()
-        return lower.contains("not authorized") || lower.contains("not authorised")
-      }
-      return false
-    #else
-      _ = errorInfo
-      return false
-    #endif
-  }
-
-  private static func runOsascript(source: String, arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    process.arguments = ["-l", "AppleScript", "-"] + arguments
-    let stdinPipe = Pipe()
-    let stderrPipe = Pipe()
-    process.standardInput = stdinPipe
-    process.standardError = stderrPipe
-    try process.run()
-    if let data = source.data(using: .utf8) {
-      stdinPipe.fileHandleForWriting.write(data)
-    }
-    stdinPipe.fileHandleForWriting.closeFile()
-    process.waitUntilExit()
-    if process.terminationStatus != 0 {
-      let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-      let message = String(data: data, encoding: .utf8) ?? "Unknown osascript error"
-      throw IMsgError.appleScriptFailure(message.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-  }
 }

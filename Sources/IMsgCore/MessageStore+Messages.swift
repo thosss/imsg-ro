@@ -104,12 +104,14 @@ extension MessageStore {
   ) throws -> [Message] {
     guard limit > 0 else { return [] }
     var cursor = afterRowID
+    var dedupeState = URLBalloonDedupeState()
     while true {
       let batch = try messagesAfterBatch(
         afterRowID: cursor,
         chatID: chatID,
         limit: limit,
-        includeReactions: includeReactions
+        includeReactions: includeReactions,
+        dedupeState: &dedupeState
       )
       if !batch.messages.isEmpty {
         return batch.messages
@@ -121,12 +123,91 @@ extension MessageStore {
     }
   }
 
+  public func messagesAfterPage(
+    afterRowID: Int64,
+    chatID: Int64?,
+    limit: Int,
+    includeReactions: Bool = false
+  ) throws -> MessagesAfterPage {
+    guard limit > 0 else {
+      return MessagesAfterPage(messages: [], nextRowID: afterRowID, hasMore: false)
+    }
+
+    return try withConnection { db in
+      var physicalLimit = limit == Int.max ? limit : limit + 1
+
+      while true {
+        let query = MessagesAfterQuery(
+          store: self,
+          afterRowID: MessageID(rawValue: afterRowID),
+          chatID: chatID.map { ChatID(rawValue: $0) },
+          limit: physicalLimit,
+          includeReactions: includeReactions
+        )
+        var physicalMessages: [Message] = []
+        var parentCache: ReplyParentCache = [:]
+        var pollOptionCache = PollOptionTextCache()
+        let rows = try db.prepareRowIterator(query.sql, bindings: query.bindings)
+        while let row = try rows.failableNext() {
+          let decoded = try decodeMessageRow(
+            row,
+            columns: query.selection.columns,
+            fallbackChatID: query.fallbackChatID
+          )
+          physicalMessages.append(
+            try message(
+              from: decoded,
+              db,
+              parentCache: &parentCache,
+              pollOptionCache: &pollOptionCache
+            ))
+        }
+
+        let visibleMessages = try pageVisibleMessages(physicalMessages, db: db)
+        if visibleMessages.count > limit {
+          let overflowRowID = visibleMessages[limit].rowID
+          let consumed = physicalMessages.prefix { $0.rowID < overflowRowID }
+          let pageMessages = try pageVisibleMessages(Array(consumed), db: db)
+          let nextRowID = consumed.last?.rowID ?? afterRowID
+          return MessagesAfterPage(
+            messages: try enrichMessagesWithTrailingURLPreviews(
+              pageMessages,
+              afterRowID: nextRowID,
+              db: db
+            ),
+            nextRowID: nextRowID,
+            hasMore: true
+          )
+        }
+        if physicalMessages.count < physicalLimit || physicalLimit == Int.max {
+          return MessagesAfterPage(
+            messages: visibleMessages,
+            nextRowID: physicalMessages.last?.rowID ?? afterRowID,
+            hasMore: false
+          )
+        }
+        guard let nextLimit = nextHistoryPhysicalLimit(after: physicalLimit) else {
+          return MessagesAfterPage(
+            messages: visibleMessages,
+            nextRowID: physicalMessages.last?.rowID ?? afterRowID,
+            hasMore: false
+          )
+        }
+        physicalLimit = nextLimit
+      }
+    }
+  }
+
   func messagesAfterBatch(
     afterRowID: Int64,
     chatID: Int64?,
     limit: Int,
-    includeReactions: Bool
+    includeReactions: Bool,
+    dedupeState: inout URLBalloonDedupeState
   ) throws -> MessagesAfterBatch {
+    guard limit > 0 else {
+      return MessagesAfterBatch(messages: [], maxScannedRowID: afterRowID)
+    }
     let query = MessagesAfterQuery(
       store: self,
       afterRowID: MessageID(rawValue: afterRowID),
@@ -171,14 +252,7 @@ extension MessageStore {
       )
       let visibleMessages = coalesced.filter { message in
         guard isURLPreviewBalloon(message) else { return true }
-        return !shouldSkipURLBalloonDuplicate(
-          chatID: message.chatID,
-          sender: message.sender,
-          text: message.text,
-          isFromMe: message.isFromMe,
-          date: message.date,
-          rowID: message.rowID
-        )
+        return !dedupeState.shouldSkip(message)
       }
       return MessagesAfterBatch(messages: visibleMessages, maxScannedRowID: maxScannedRowID)
     }
@@ -257,7 +331,7 @@ extension MessageStore {
     guard !trimmed.isEmpty else { return nil }
 
     return try withConnection { db in
-      let columns = MessageStore.tableColumns(connection: db, table: "message")
+      let columns = try MessageStore.tableColumns(connection: db, table: "message")
       func column(_ name: String, defaultValue: String) -> String {
         columns.contains(name.lowercased()) ? "m.\(name)" : defaultValue
       }
@@ -277,7 +351,7 @@ extension MessageStore {
                \(column("is_pending_satellite_send", defaultValue: "0")) AS is_pending_satellite_send,
                \(column("was_downgraded", defaultValue: "0")) AS was_downgraded
         FROM message m
-        WHERE \(column("guid", defaultValue: "''")) = ?
+        WHERE \(column("guid", defaultValue: "''")) = ? COLLATE NOCASE
         ORDER BY m.ROWID DESC
         LIMIT 1
         """

@@ -15,7 +15,7 @@ func rpcSendEnablesSMSFallbackForAutoTextDirectSend() async throws {
     verbose: false,
     output: output,
     sendMessage: { options in captured = options },
-    resolveSentMessage: { _, _, _, _ in nil }
+    resolveSentMessage: resolvedSentMessageFixture
   )
 
   let line =
@@ -24,6 +24,31 @@ func rpcSendEnablesSMSFallbackForAutoTextDirectSend() async throws {
 
   #expect(captured?.service == .auto)
   #expect(captured?.allowSMSFallback == true)
+}
+
+@Test
+func rpcSendCanDisableOtherwiseEligibleSMSFallbackWithoutChangingAutoService() async throws {
+  for key in ["allow_sms_fallback", "allowSMSFallback"] {
+    let store = try CommandTestDatabase.makeStoreForRPC()
+    let output = TestRPCOutput()
+    var captured: MessageSendOptions?
+    let server = RPCServer(
+      store: store,
+      verbose: false,
+      output: output,
+      sendMessage: { captured = $0 },
+      resolveSentMessage: resolvedSentMessageFixture
+    )
+
+    await server.handleLineForTesting(
+      "{\"jsonrpc\":\"2.0\",\"id\":\"no-fallback\",\"method\":\"send\","
+        + "\"params\":{\"to\":\"+15551234567\",\"text\":\"yo\",\"\(key)\":false}}"
+    )
+
+    #expect(captured?.service == .auto)
+    #expect(captured?.allowSMSFallback == false)
+    #expect(output.errors.isEmpty)
+  }
 }
 
 @Test
@@ -47,7 +72,7 @@ func rpcSendAutoUsesLocalSMSHistoryForAttachmentSend() async throws {
     verbose: false,
     output: output,
     sendMessage: { options in captured = options },
-    resolveSentMessage: { _, _, _, _ in nil }
+    resolveSentMessage: resolvedSentMessageFixture
   )
 
   let line =
@@ -100,7 +125,7 @@ func rpcSendDisablesSMSFallbackForExplicitService() async throws {
     verbose: false,
     output: output,
     sendMessage: { options in captured = options },
-    resolveSentMessage: { _, _, _, _ in nil }
+    resolveSentMessage: resolvedSentMessageFixture
   )
 
   let line =

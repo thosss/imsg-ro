@@ -1,6 +1,118 @@
 # Changelog
 
-## 0.13.4 - Unreleased
+## Unreleased
+
+### Safety (fork)
+
+- Merge upstream 0.14.2 and carry the fork's `--read-only` and `--redact-codes`
+  flags onto the rewritten RPC layer.
+- `--read-only`: the permitted-method allow-list is now derived from each
+  method's declared `RPCMethodDescriptor.lane` instead of a hand-maintained
+  name list, so a newly added mutating method is refused by default rather than
+  when someone remembers to classify it. Unregistered method names are still
+  refused before dispatch.
+- **Breaking (fork):** the read-only JSON-RPC refusal code moved from `-32001`
+  to `-32005`. Upstream now uses `-32001` for `deliveryFailure` ("Delivery
+  outcome unknown"); sharing one code would leave a client unable to tell
+  "refused, nothing ran" from "may already have been delivered". A test now
+  asserts the code stays distinct from every other error this server emits.
+- `imsg status --json` now filters `rpc_methods` to the methods that would
+  actually be accepted when read-only is active, instead of advertising calls
+  that the gate will refuse.
+- `--redact-codes` now also covers the `messages.search` and `messages.after`
+  RPC methods introduced upstream. Both return message text and would otherwise
+  have been unredacted holes.
+
+### Fixes
+
+- Fall back to raw chat identifiers for empty display names and distinguish unavailable Contacts from unmatched local nicknames (#250, thanks @riverr4t).
+- Let headless `nickname --local` return without an unanswered Contacts permission prompt while preserving interactive prompting (#248, thanks @SebTardif).
+
+### Dependencies
+
+- Update PhoneNumberKit to 5.0.8 for current phone-number metadata.
+
+## 0.14.2 - 2026-08-28
+
+### Highlights
+
+- Direct sends recover safely when a conversation is missing from Messages.app's live chats. Headless `watch` and `search` no longer stall on an unanswered Contacts permission prompt.
+
+### Fixes
+
+- Recover missing live direct-chat objects through the verified participant on the original account before dispatch, for CLI and RPC sends (#244, thanks @0xble).
+- Let headless `watch` and `search` start without waiting for an undetermined Contacts permission prompt while preserving interactive prompting (#238, thanks @SebTardif).
+
+### JSON-RPC
+
+- Add `send.tracked` with caller-owned message IDs so bridge clients can reconcile a lost response through `message.send_status` without guessing which message was sent (#235, thanks @clawSean).
+
+### Dependencies
+
+- Update PhoneNumberKit to 5.0.7 for current phone-number metadata (#245).
+
+### Maintenance
+
+- Restrict CI workflow tokens to read-only repository access (#242, thanks @vincentkoc).
+- Update the CI SwiftLint pin to 0.65.1 and the docs build runtime to Node 26, and make the rich-link cancellation test deterministic (#245).
+
+## 0.14.1 - 2026-08-11
+
+**Highlight:** search now finds messages whose text lives only in the rich-text
+body — previously these were silently invisible to every query.
+
+### Fixes
+
+- Search messages whose body exists only in `attributedBody` (rich text): the SQL prefilter excluded them before decoding could run, so such messages could never match. Candidates are now admitted and matched on decoded text, with logical limits preserved (#233, thanks @lincicomb for the report)
+
+### Maintenance
+
+- Harden the release pipeline: robust signer import, PKCS12 compatibility, Bash 3 signer support, signing-keychain handling, and draft metadata/ID lookups (#225–#231)
+
+## 0.14.0 - 2026-08-10
+
+### Highlights
+- JSON-RPC now has a bounded, recoverable long-lived runtime with protocol-v1 capability reporting, authoritative delivery outcomes, live database/contact refresh, and independently owned database and bridge-event subscriptions.
+- RPC now matches the CLI for message search, ROWID pagination, multipart and rich-attachment sends, poll selectors, attachment reply parts, canonical chat payloads, and SMS fallback control.
+
+### JSON-RPC
+- fix: match CLI poll option resolution and preserve reply part indexes for attachment sends (#213).
+- fix: reject malformed JSON-RPC framing, unknown parameters, conflicting aliases, and coerced values before side effects (#214).
+- fix: bound admitted work, serialize mutations, cap concurrent reads and subscriptions, drain accepted work on EOF, and terminate overflowing watch streams with resumable cursors (#215).
+- fix: report typed delivery dispositions, prevent retries after uncertain bridge or AppleScript sends, verify AppleScript routing, and block only the mutation lane after an in-flight outcome (#216).
+- feat: add protocol-v1 `initialize` and `status`, dynamic capability reporting, non-launching bridge probes, degraded database startup, and same-child recovery (#217).
+- fix: refresh Contacts and mutable chat metadata throughout long-lived sessions, honor each send request's region, and remove process-lifetime routing caches (#218).
+- feat: add `messages.search`, `send.multipart`, rich-file sends, canonical `chats.list` payloads, explicit SMS fallback control, strict semantic validation, and GUID-plus-row-baseline delivery verification (#219).
+- feat: add bounded non-resumable `bridge.events.subscribe` streams with rotation-safe tailing, shared subscription limits, typed terminal errors, and best-effort CLI bridge events (#220).
+- fix: isolate URL-preview replay deduplication per call or watcher and rotate new RPC requests across replaced database generations without swapping active subscriptions (#221).
+- feat: add bounded `messages.after` pagination with authoritative database-instance-scoped ROWID cursors, cross-chat catchup, and optional standalone reaction events (#200, #201, thanks @vincentkoc).
+- fix: let non-interactive RPC startup proceed without a Contacts prompt while rejecting ambiguous name targets when Contacts is unavailable (#186, #187, thanks @SebTardif).
+- fix: fail vanished bridge queue requests immediately without treating an unobserved claim as safe to retry, avoiding long stalls and duplicate sends (#199, thanks @omarshahine).
+
+### Reliability
+- fix: bound osascript send, reaction, and helper-process waits with process-tree cleanup so stalled subprocesses cannot hang CLI or RPC work (#197, thanks @SebTardif).
+- test: replace scheduler-sensitive timing assumptions with deterministic process, launch, refresh, subscription, and file-source readiness gates.
+- ci: run required macOS validation on GitHub-hosted macOS 26 alongside the Linux read-core lane.
+
+### Advanced IMCore
+- fix: open trusted sticker staging roots directly so sandboxed Messages can send staged stickers (#211, #212, thanks @clawcrab).
+- fix: render complete native poll selection snapshots in human-readable history and watch output while preserving the existing poll-vote prefix (#198, thanks @clawSean).
+
+### Documentation
+- docs: rewrite the README as a concise front door to installation, core workflows, and the full documentation site (#206).
+- docs: explain the benign Contacts framework stderr message seen with some CardDAV accounts (#207, #210, thanks @prashantkamani).
+
+### Packaging and Dependencies
+- build: adopt the shared signed, notarized, independently verified Swift CLI release workflow with automatic Homebrew handoff (#205).
+- chore: update PhoneNumberKit, SwiftLint, the Linux Swift toolchain, `actions/setup-node`, and pinned GitHub Actions to current releases (#202, #210).
+
+## 0.13.4 - 2026-07-27
+
+### Highlights
+- Native poll captions can now be suppressed with `--no-comment` when callers already render their own context (thanks @omarshahine).
+
+### Native Polls
+- feat: let CLI and JSON-RPC callers suppress automatic native poll captions with `--no-comment` or `suppress_comment` when they already render context (#196, thanks @omarshahine).
 
 ### Safety
 - feat: add a global `--read-only` flag (and `IMSG_READ_ONLY=1` environment variable) that deterministically refuses every write or mutation across the CLI and JSON-RPC. Read commands are unaffected; write commands exit with a dedicated code (3) and a clear message, and mutating RPC methods return a well-formed JSON-RPC error (`code: -32001`) without breaking the protocol. `imsg status` reports the active mode (`read_only` in `--json`).

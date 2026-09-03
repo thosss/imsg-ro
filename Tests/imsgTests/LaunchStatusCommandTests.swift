@@ -70,3 +70,14 @@ func statusOnlyAdvertisesStickerSendWhenSelectorsAreReady() {
     StatusCommand.availableBridgeSendCommands(selectors: ["stickerSend": true])
       .contains("send-sticker"))
 }
+
+@Test
+func statusOnlyAdvertisesTrackedSendForCurrentHelperCapability() {
+  #expect(!StatusCommand.advertisedRPCMethods(selectors: [:]).contains("send.tracked"))
+  #expect(
+    !StatusCommand.advertisedRPCMethods(selectors: ["clientMessageGuidReservation": false])
+      .contains("send.tracked"))
+  #expect(
+    StatusCommand.advertisedRPCMethods(selectors: ["clientMessageGuidReservation": true])
+      .contains("send.tracked"))
+}

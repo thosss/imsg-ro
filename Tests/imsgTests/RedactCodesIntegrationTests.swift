@@ -142,6 +142,75 @@ func rpcMessagesHistoryLeavesTextAloneWithoutRedactCodes() async throws {
   #expect(messages.first?["text"] as? String == "483920 is your verification code.")
 }
 
+// MARK: - RPC: messages.search / messages.after
+//
+// Both methods arrived in the 0.14.x upstream merge and return message text,
+// so they are redaction surfaces that did not exist when --redact-codes was
+// written. These tests exist so the coverage cannot silently regress if the
+// handlers are refactored.
+
+@Test
+func rpcMessagesSearchRedactsCodesWhenServerConfigured() async throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, redactCodes: true, output: output)
+
+  let line =
+    #"{"jsonrpc":"2.0","id":1,"method":"messages.search","params":{"query":"verification"}}"#
+  await server.handleLineForTesting(line)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let messages = result?["messages"] as? [[String: Any]] ?? []
+  #expect(messages.count == 1)
+  #expect(messages.first?["text"] as? String == "[redacted] is your verification code.")
+}
+
+@Test
+func rpcMessagesSearchLeavesTextAloneWithoutRedactCodes() async throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, redactCodes: false, output: output)
+
+  let line =
+    #"{"jsonrpc":"2.0","id":1,"method":"messages.search","params":{"query":"verification"}}"#
+  await server.handleLineForTesting(line)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let messages = result?["messages"] as? [[String: Any]] ?? []
+  #expect(messages.first?["text"] as? String == "483920 is your verification code.")
+}
+
+@Test
+func rpcMessagesAfterRedactsCodesWhenServerConfigured() async throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, redactCodes: true, output: output)
+
+  let line =
+    #"{"jsonrpc":"2.0","id":1,"method":"messages.after","params":{"since_rowid":0}}"#
+  await server.handleLineForTesting(line)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let messages = result?["messages"] as? [[String: Any]] ?? []
+  #expect(messages.count == 1)
+  #expect(messages.first?["text"] as? String == "[redacted] is your verification code.")
+}
+
+@Test
+func rpcMessagesAfterLeavesTextAloneWithoutRedactCodes() async throws {
+  let store = try makeStoreWithMessageText("483920 is your verification code.")
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, redactCodes: false, output: output)
+
+  let line =
+    #"{"jsonrpc":"2.0","id":1,"method":"messages.after","params":{"since_rowid":0}}"#
+  await server.handleLineForTesting(line)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let messages = result?["messages"] as? [[String: Any]] ?? []
+  #expect(messages.first?["text"] as? String == "483920 is your verification code.")
+}
+
 // MARK: - RuntimeOptions
 
 @Test

@@ -27,7 +27,7 @@ func rpcReadOnlyRejectsMutatingMethod() async throws {
   // JSON-RPC framing is preserved: id is echoed.
   #expect(envelope["id"] as? String == "7")
   let error = envelope["error"] as? [String: Any]
-  #expect(int64(error?["code"]) == -32001)
+  #expect(int64(error?["code"]) == Int64(kReadOnlyRPCErrorCode))
   #expect(error?["data"] as? String == "send")
 }
 
@@ -40,7 +40,9 @@ func rpcReadOnlyRejectsRepresentativeMutations() async throws {
     let line = #"{"jsonrpc":"2.0","id":"1","method":"\#(method)","params":{}}"#
     await server.handleLineForTesting(line)
     let error = output.errors.first?["error"] as? [String: Any]
-    #expect(int64(error?["code"]) == -32001, "\(method) should be refused in read-only mode")
+    #expect(
+      int64(error?["code"]) == Int64(kReadOnlyRPCErrorCode),
+      "\(method) should be refused in read-only mode")
   }
 }
 
@@ -69,7 +71,7 @@ func rpcReadWriteServerStillSendsWhenNotReadOnly() async throws {
   await server.handleLineForTesting(line)
 
   let error = output.errors.first?["error"] as? [String: Any]
-  #expect(int64(error?["code"]) != -32001)
+  #expect(int64(error?["code"]) != Int64(kReadOnlyRPCErrorCode))
 }
 
 @Test
@@ -86,7 +88,7 @@ func rpcReadOnlyRejectsUnknownMethodRatherThanFailingOpen() async throws {
   await server.handleLineForTesting(line)
 
   let error = output.errors.first?["error"] as? [String: Any]
-  #expect(int64(error?["code"]) == -32001)
+  #expect(int64(error?["code"]) == Int64(kReadOnlyRPCErrorCode))
 }
 
 @Test
@@ -97,4 +99,45 @@ func rpcMethodClassificationIsComplete() {
   #expect(kReadOnlyRPCMethods.union(kMutatingRPCMethods) == supported)
   // Read methods must never be treated as mutating.
   #expect(kReadOnlyRPCMethods.isSubset(of: supported))
+}
+
+@Test
+func rpcReadOnlyErrorCodeDoesNotCollide() {
+  // A read-only refusal means "nothing happened, safe to stop"; the codes
+  // below mean other things entirely — notably deliveryFailure's -32001, which
+  // can mean "may already have been delivered". A client that keys off `code`
+  // must never confuse them, so the read-only code has to stay unique.
+  //
+  // This is a real regression: read-only originally used -32001, and an
+  // upstream merge later assigned that same code to deliveryFailure.
+  let others: [RPCError] = [
+    .invalidParams("x"),
+    .internalError("x"),
+    .methodNotFound("x"),
+    .serverBusy("x"),
+    .databaseUnavailable(path: "/tmp/x", detail: "x"),
+    .bridgeUnavailable(),
+    .bridgeEventsUnavailable(detail: "x"),
+    .deliveryFailure(
+      DeliveryFailure(
+        disposition: .mayHaveCompleted,
+        transport: .appleScript,
+        operation: "send",
+        detail: "x"
+      )),
+    .mutationLaneBlocked(
+      DeliveryFailure(
+        disposition: .stillInFlight,
+        transport: .appleScript,
+        operation: "send",
+        detail: "x"
+      )),
+  ]
+
+  #expect(RPCError.readOnly("send").code == kReadOnlyRPCErrorCode)
+  for other in others {
+    #expect(
+      other.code != kReadOnlyRPCErrorCode,
+      "\(other.message) reuses the read-only code \(kReadOnlyRPCErrorCode)")
+  }
 }

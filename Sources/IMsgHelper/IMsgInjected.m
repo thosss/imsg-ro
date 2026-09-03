@@ -138,6 +138,8 @@ static NSTimer *fileWatchTimer = nil;
 static NSTimer *rpcInboxTimer = nil;
 static BOOL bridgeDidBootstrap = NO;
 static os_unfair_lock eventsLock = OS_UNFAIR_LOCK_INIT;
+static os_unfair_lock trackedMessageGuidLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableSet<NSString *> *trackedMessageGuids = nil;
 static int lockFd = -1;
 
 static const NSUInteger kEventsRotateBytes = 1 * 1024 * 1024;
@@ -550,6 +552,27 @@ static NSDictionary* errorResponse(NSInteger requestId, NSString *error) {
     };
 }
 
+static NSDictionary* errorResponseWithDisposition(NSInteger requestId,
+                                                   NSString *error,
+                                                   NSString *disposition) {
+    NSMutableDictionary *response = [errorResponse(requestId, error) mutableCopy];
+    if (disposition.length) response[@"delivery_disposition"] = disposition;
+    return response;
+}
+
+/// The injected helper is the cross-process ownership boundary for tracked
+/// sends. Reserve each caller GUID once immediately before dispatch so two RPC
+/// children cannot both publish messages with the same identity.
+static BOOL reserveTrackedMessageGuid(NSString *guid) {
+    if (!guid.length) return NO;
+    os_unfair_lock_lock(&trackedMessageGuidLock);
+    if (!trackedMessageGuids) trackedMessageGuids = [NSMutableSet set];
+    BOOL available = ![trackedMessageGuids containsObject:guid];
+    if (available) [trackedMessageGuids addObject:guid];
+    os_unfair_lock_unlock(&trackedMessageGuidLock);
+    return available;
+}
+
 static NSString *serviceNameForChat(IMChat *chat, NSString *chatGuid) {
     NSString *serviceName = nil;
     if ([chat respondsToSelector:@selector(account)]) {
@@ -957,6 +980,29 @@ static BOOL stickerAssociatedMessageInitializerAvailable(void) {
             @"initIMMessageWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:associatedMessageGUID:associatedMessageType:associatedMessageRange:messageSummaryInfo:")];
 }
 
+static BOOL plainMessageInitializerAvailable(void) {
+    Class messageClass = NSClassFromString(@"IMMessage");
+    Class itemClass = NSClassFromString(@"IMMessageItem");
+    BOOL itemPath = itemClass && messageClass
+        && [itemClass instancesRespondToSelector:NSSelectorFromString(
+            @"initWithSender:time:body:attributes:fileTransferGUIDs:flags:error:guid:threadIdentifier:")]
+        && [messageClass respondsToSelector:NSSelectorFromString(
+            @"messageFromIMMessageItem:sender:subject:")];
+    return itemPath || stickerAttachmentMessageInitializerAvailable()
+        || [messageClass instancesRespondToSelector:@selector(initWithText:flags:)];
+}
+
+static BOOL clientMessageGuidInitializerAvailable(void) {
+    Class messageClass = NSClassFromString(@"IMMessage");
+    Class itemClass = NSClassFromString(@"IMMessageItem");
+    BOOL itemPath = itemClass && messageClass
+        && [itemClass instancesRespondToSelector:NSSelectorFromString(
+            @"initWithSender:time:body:attributes:fileTransferGUIDs:flags:error:guid:threadIdentifier:")]
+        && [messageClass respondsToSelector:NSSelectorFromString(
+            @"messageFromIMMessageItem:sender:subject:")];
+    return itemPath || stickerAttachmentMessageInitializerAvailable();
+}
+
 static BOOL stickerTransferSelectorsAvailable(void) {
     Class transferClass = NSClassFromString(@"IMFileTransfer");
     Class centerClass = NSClassFromString(@"IMFileTransferCenter");
@@ -972,11 +1018,13 @@ static BOOL stickerTransferSelectorsAvailable(void) {
 
 static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
     Class registryClass = NSClassFromString(@"IMChatRegistry");
-    BOOL hasRegistry = (registryClass != nil);
+    id registry = registryClass && [registryClass respondsToSelector:@selector(sharedInstance)]
+        ? [registryClass performSelector:@selector(sharedInstance)]
+        : nil;
+    BOOL hasRegistry = (registry != nil);
     NSUInteger chatCount = 0;
 
     if (hasRegistry) {
-        id registry = [registryClass performSelector:@selector(sharedInstance)];
         if ([registry respondsToSelector:@selector(allExistingChats)]) {
             NSArray *chats = [registry performSelector:@selector(allExistingChats)];
             chatCount = chats.count;
@@ -986,6 +1034,31 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
     NSDictionary *nicknameSelectors = nicknameSharingSelectorStatus();
     Class stickerTransferClass = NSClassFromString(@"IMFileTransfer");
     Class transferCenterClass = NSClassFromString(@"IMFileTransferCenter");
+    Class chatClass = NSClassFromString(@"IMChat");
+    Class handleRegistrarClass = NSClassFromString(@"IMHandleRegistrar");
+    Class idQueryClass = NSClassFromString(@"IDSIDQueryController");
+    Class accountControllerClass = NSClassFromString(@"IMAccountController");
+    Class accountClass = NSClassFromString(@"IMAccount");
+    Class handleClass = NSClassFromString(@"IMHandle");
+    BOOL handleRegistrar = handleRegistrarClass
+        && [handleRegistrarClass respondsToSelector:@selector(sharedInstance)]
+        && ([handleRegistrarClass instancesRespondToSelector:@selector(IMHandleWithID:)]
+            || [handleRegistrarClass instancesRespondToSelector:@selector(getIMHandlesForID:)]);
+    BOOL activeSenderHandle = accountControllerClass && accountClass && handleClass
+        && [accountControllerClass respondsToSelector:@selector(sharedInstance)]
+        && [accountControllerClass instancesRespondToSelector:@selector(activeIMessageAccount)]
+        && [accountClass instancesRespondToSelector:@selector(loginIMHandle)]
+        && [handleClass instancesRespondToSelector:@selector(ID)];
+    BOOL chatSend = [chatClass instancesRespondToSelector:@selector(sendMessage:)]
+        && plainMessageInitializerAvailable();
+    BOOL clientMessageGuid = [chatClass instancesRespondToSelector:@selector(sendMessage:)]
+        && clientMessageGuidInitializerAvailable();
+    BOOL reactionSend = [chatClass instancesRespondToSelector:@selector(sendMessage:)]
+        && stickerAssociatedMessageInitializerAvailable();
+    BOOL typingAvailable = hasRegistry
+        && [chatClass instancesRespondToSelector:@selector(setLocalUserIsTyping:)];
+    BOOL readAvailable = hasRegistry
+        && [chatClass instancesRespondToSelector:@selector(markAllMessagesAsRead)];
     BOOL stickerSetIsSticker = [stickerTransferClass instancesRespondToSelector:
         NSSelectorFromString(@"setIsSticker:")];
     BOOL stickerSetUserInfo = [stickerTransferClass instancesRespondToSelector:
@@ -999,6 +1072,26 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
             NSSelectorFromString(@"transferForGUID:")]
         && [transferCenterClass instancesRespondToSelector:
             NSSelectorFromString(@"registerTransferWithDaemon:")];
+    BOOL createChat = handleRegistrar && hasRegistry
+        && ([registryClass instancesRespondToSelector:@selector(chatForIMHandle:)]
+            || [registryClass instancesRespondToSelector:@selector(chatForIMHandles:)]);
+    BOOL addParticipant = handleRegistrar
+        && ([chatClass instancesRespondToSelector:NSSelectorFromString(
+                @"inviteParticipants:reason:")]
+            || [chatClass instancesRespondToSelector:NSSelectorFromString(
+                @"inviteParticipantsToiMessageChat:reason:")]);
+    BOOL removeParticipant = [chatClass instancesRespondToSelector:@selector(participants)]
+        && ([chatClass instancesRespondToSelector:NSSelectorFromString(
+                @"removeParticipants:reason:")]
+            || [chatClass instancesRespondToSelector:NSSelectorFromString(
+                @"removeParticipantsFromiMessageChat:reason:")]);
+    BOOL handleCheck = idQueryClass
+        && ([idQueryClass respondsToSelector:@selector(sharedInstance)]
+            || [idQueryClass respondsToSelector:@selector(sharedController)])
+        && ([idQueryClass instancesRespondToSelector:
+                @selector(_currentIDStatusForDestination:service:listenerID:)]
+            || [idQueryClass instancesRespondToSelector:
+                @selector(currentIDStatusForDestination:service:)]);
     BOOL stickerReplyTo = [NSClassFromString(@"IMMessage")
         instancesRespondToSelector:NSSelectorFromString(@"setReplyToGUID:")];
     BOOL stickerTargetMembership = [NSClassFromString(@"IMChat")
@@ -1016,16 +1109,45 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
             instancesRespondToSelector:NSSelectorFromString(@"messagePartRange")];
     BOOL stickerAttachmentMessage = stickerAttachmentMessageInitializerAvailable();
     BOOL stickerAssociatedMessage = stickerAssociatedMessageInitializerAvailable();
+    BOOL attachmentSend = stickerTransferCenter && stickerAttachmentMessage
+        && [chatClass instancesRespondToSelector:@selector(sendMessage:)];
     BOOL stickerSend = stickerSetIsSticker && stickerSetUserInfo
-        && stickerSetAttribution && stickerTransferCenter && stickerAttachmentMessage;
+        && stickerSetAttribution && attachmentSend;
     NSDictionary *selectors = @{
         @"editMessageItemTranslation": @(gHasEditMessageItemTranslation),
         @"editMessageItem": @(gHasEditMessageItem),
         @"editMessage": @(gHasEditMessage),
         @"retractMessagePart": @(gHasRetractMessagePart),
         @"sendMessageReason": @(gHasSendMessageReason),
-        @"pollPayloadMessage": @(pollPayloadMessageInitializerAvailable()),
-        @"pollVoteMessage": @(pollVoteMessageInitializerAvailable()),
+        @"sendMessage": @(chatSend),
+        @"clientMessageGuid": @(clientMessageGuid),
+        @"clientMessageGuidReservation": @(clientMessageGuid),
+        @"sendAttachment": @(attachmentSend),
+        @"sendMultipart": @(chatSend),
+        @"sendReaction": @(reactionSend),
+        @"pollPayloadMessage": @(
+            [chatClass instancesRespondToSelector:@selector(sendMessage:)]
+                && pollPayloadMessageInitializerAvailable()),
+        @"pollVoteMessage": @(
+            [chatClass instancesRespondToSelector:@selector(sendMessage:)]
+                && pollVoteMessageInitializerAvailable() && activeSenderHandle),
+        @"typing": @(typingAvailable),
+        @"read": @(readAvailable),
+        @"createChat": @(createChat),
+        @"markChatUnread": @(
+            [chatClass instancesRespondToSelector:@selector(markLastMessageAsUnread)]),
+        @"deleteMessage": @(
+            [chatClass instancesRespondToSelector:@selector(deleteChatItems:)]),
+        @"notifyAnyways": @(
+            [chatClass instancesRespondToSelector:@selector(markChatItemAsNotifyRecipient:)]),
+        @"setDisplayName": @(
+            [chatClass instancesRespondToSelector:@selector(_setDisplayName:)]),
+        @"updateGroupPhoto": @(
+            [chatClass instancesRespondToSelector:@selector(sendGroupPhotoUpdate:)]),
+        @"addParticipant": @(addParticipant),
+        @"removeParticipant": @(removeParticipant),
+        @"leaveChat": @([chatClass instancesRespondToSelector:@selector(leaveChat)]),
+        @"checkIMessageAvailability": @(handleCheck),
         @"nicknameLookup": nicknameSelectors[@"nickname_lookup"],
         @"namePhotoShouldOffer": nicknameSelectors[@"should_offer"],
         @"namePhotoShare": nicknameSelectors[@"share"],
@@ -1044,7 +1166,9 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
                 && stickerAssociatedMessage),
         @"urlPreviewMessage": @(urlPreviewMessageInitializerAvailable()),
         @"sendRichLinkAction": @YES,
-        @"pollUpdateMessage": @(pollVoteMessageInitializerAvailable()),
+        @"pollUpdateMessage": @(
+            [chatClass instancesRespondToSelector:@selector(sendMessage:)]
+                && pollVoteMessageInitializerAvailable() && activeSenderHandle),
         @"deleteChat": @(hasRegistry &&
             [registryClass instancesRespondToSelector:NSSelectorFromString(@"deleteChat:")]),
         @"removeChat": @(hasRegistry &&
@@ -1055,11 +1179,12 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
         @"injected": @YES,
         @"registry_available": @(hasRegistry),
         @"chat_count": @(chatCount),
-        @"typing_available": @(hasRegistry),
-        @"read_available": @(hasRegistry),
+        @"typing_available": @(typingAvailable),
+        @"read_available": @(readAvailable),
         @"bridge_version": @2,
         @"v2_ready": @(rpcInboxTimer != nil),
         @"attachment_metadata": @YES,
+        @"client_message_guid": @(clientMessageGuid),
         @"selectors": selectors
     });
 }
@@ -1443,7 +1568,8 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
                                     NSRange associatedMessageRange,
                                     NSDictionary *summaryInfo,
                                     NSArray *fileTransferGuids,
-                                    BOOL isAudioMessage) {
+                                    BOOL isAudioMessage,
+                                    NSString *clientMessageGuid) {
     Class IMMessageClass = NSClassFromString(@"IMMessage");
     Class IMMessageItemClass = NSClassFromString(@"IMMessageItem");
     if (!IMMessageClass || !IMMessageItemClass) return nil;
@@ -1460,7 +1586,9 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
     NSDate *now = [NSDate date];
     NSArray *transferGuids = fileTransferGuids ?: @[];
     NSError *err = nil;
-    NSString *guid = [[NSUUID UUID] UUIDString];
+    NSString *guid = clientMessageGuid.length
+        ? clientMessageGuid
+        : [[NSUUID UUID] UUIDString];
     // BlueBubblesHelper-verified flag set: 0x100005 (FromMe | Finished |
     // 0x100000 finalize bit) for normal text+attachment, 0x10000d when a
     // subject is set, 0x300005 for audio messages. The earlier `0x5`
@@ -2690,7 +2818,8 @@ static id buildIMMessage(NSAttributedString *body,
                          NSDictionary *summaryInfo,
                          NSArray *fileTransferGuids,
                          BOOL isAudioMessage,
-                         BOOL ddScan) {
+                         BOOL ddScan,
+                         NSString *clientMessageGuid) {
     // Reactions take a different code path entirely (macOS 26 init below) —
     // the IMMessageItem-first construction can't carry associated-message
     // fields atomically, and post-init setters don't survive the wrap.
@@ -2710,7 +2839,8 @@ static id buildIMMessage(NSAttributedString *body,
                                                 associatedMessageRange,
                                                 summaryInfo,
                                                 fileTransferGuids,
-                                                isAudioMessage);
+                                                isAudioMessage,
+                                                clientMessageGuid);
         if (viaItem) return viaItem;
     }
     // Legacy fallback for older macOS that doesn't expose the
@@ -2736,6 +2866,7 @@ static id buildIMMessage(NSAttributedString *body,
             [inv setSelector:macos26Sel];
             [inv setTarget:msg];
             id nilObj = nil;
+            id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
             NSDate *now = [NSDate date];
             [inv setArgument:&nilObj atIndex:2];           // sender
             [inv setArgument:&now atIndex:3];              // time
@@ -2744,7 +2875,7 @@ static id buildIMMessage(NSAttributedString *body,
             [inv setArgument:&fileTransferGuids atIndex:6];
             [inv setArgument:&flags atIndex:7];
             [inv setArgument:&nilObj atIndex:8];           // error
-            [inv setArgument:&nilObj atIndex:9];           // guid
+            [inv setArgument:&messageGuid atIndex:9];      // guid
             [inv setArgument:&nilObj atIndex:10];          // subject (string)
             [inv setArgument:&associatedMessageGuid atIndex:11];
             [inv setArgument:&associatedMessageType atIndex:12];
@@ -2779,6 +2910,7 @@ static id buildIMMessage(NSAttributedString *body,
             [inv setSelector:sel];
             [inv setTarget:msg];
             id nilObj = nil;
+            id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
             NSDate *now = [NSDate date];
             [inv setArgument:&nilObj atIndex:2];        // sender
             [inv setArgument:&now atIndex:3];           // time
@@ -2787,7 +2919,7 @@ static id buildIMMessage(NSAttributedString *body,
             [inv setArgument:&fileTransferGuids atIndex:6];
             [inv setArgument:&flags atIndex:7];
             [inv setArgument:&nilObj atIndex:8];        // error
-            [inv setArgument:&nilObj atIndex:9];        // guid
+            [inv setArgument:&messageGuid atIndex:9];   // guid
             [inv setArgument:&nilObj atIndex:10];       // subject (string form)
             [inv setArgument:&nilObj atIndex:11];       // balloonBundleID
             [inv setArgument:&nilObj atIndex:12];       // payloadData
@@ -2827,6 +2959,7 @@ static id buildIMMessage(NSAttributedString *body,
         [inv setSelector:bbSendSel];
         [inv setTarget:m];
         id nilObj = nil;
+        id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
         NSDate *now = [NSDate date];
         [inv setArgument:&nilObj atIndex:2];           // sender
         [inv setArgument:&now atIndex:3];              // time
@@ -2835,7 +2968,7 @@ static id buildIMMessage(NSAttributedString *body,
         [inv setArgument:&fileTransferGuids atIndex:6];
         [inv setArgument:&flags atIndex:7];
         [inv setArgument:&nilObj atIndex:8];           // error
-        [inv setArgument:&nilObj atIndex:9];           // guid
+        [inv setArgument:&messageGuid atIndex:9];      // guid
         [inv setArgument:&nilObj atIndex:10];          // subject string
         [inv setArgument:&nilObj atIndex:11];          // balloonBundleID
         [inv setArgument:&nilObj atIndex:12];          // payloadData
@@ -2865,6 +2998,7 @@ static id buildIMMessage(NSAttributedString *body,
         [inv setSelector:sel];
         [inv setTarget:msg];
         id nilObj = nil;
+        id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
         NSDate *now = [NSDate date];
         [inv setArgument:&nilObj atIndex:2];           // sender
         [inv setArgument:&now atIndex:3];              // time
@@ -2873,7 +3007,7 @@ static id buildIMMessage(NSAttributedString *body,
         [inv setArgument:&fileTransferGuids atIndex:6];
         [inv setArgument:&flags atIndex:7];
         [inv setArgument:&nilObj atIndex:8];           // error
-        [inv setArgument:&nilObj atIndex:9];           // guid
+        [inv setArgument:&messageGuid atIndex:9];      // guid
         [inv setArgument:&nilObj atIndex:10];          // subject string
         [inv setArgument:&nilObj atIndex:11];          // balloonBundleID
         [inv setArgument:&nilObj atIndex:12];          // payloadData
@@ -2889,7 +3023,7 @@ static id buildIMMessage(NSAttributedString *body,
 
     // The simplest initializer cannot carry transfer GUIDs. An attachment
     // must fail closed instead of reporting a successful text-only send.
-    if (hasAttachment) return nil;
+    if (hasAttachment || clientMessageGuid.length) return nil;
 
     // Last resort: simplest 2-arg initializer if the long form isn't available.
     SEL simple = @selector(initWithText:flags:);
@@ -3116,6 +3250,14 @@ static NSDictionary* errorResponseV2(NSString *uuid, NSString *error) {
         @"error": error ?: @"Unknown error",
         @"timestamp": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
     };
+}
+
+static NSDictionary* errorResponseV2WithDisposition(NSString *uuid,
+                                                     NSString *error,
+                                                     NSString *disposition) {
+    NSMutableDictionary *response = [errorResponseV2(uuid, error) mutableCopy];
+    if (disposition.length) response[@"delivery_disposition"] = disposition;
+    return response;
 }
 
 #pragma mark - Inbound Events (v2)
@@ -3468,6 +3610,7 @@ static NSDictionary *handleSendMessage(NSInteger requestId, NSDictionary *params
     id ddScanValue = params[@"ddScan"];
     id attributedBodyValue = params[@"attributedBody"];
     id textFormattingValue = params[@"textFormatting"];
+    id clientMessageGuidValue = params[@"clientMessageGuid"];
     if (![chatGuidValue isKindOfClass:[NSString class]] ||
         (messageValue && ![messageValue isKindOfClass:[NSString class]]) ||
         (effectIdValue && ![effectIdValue isKindOfClass:[NSString class]]) ||
@@ -3478,7 +3621,9 @@ static NSDictionary *handleSendMessage(NSInteger requestId, NSDictionary *params
         (partIndexValue && !richLinkIntegerNumber(partIndexValue)) ||
         (ddScanValue && ![ddScanValue isKindOfClass:[NSNumber class]]) ||
         (attributedBodyValue && ![attributedBodyValue isKindOfClass:[NSString class]]) ||
-        (textFormattingValue && ![textFormattingValue isKindOfClass:[NSArray class]])) {
+        (textFormattingValue && ![textFormattingValue isKindOfClass:[NSArray class]]) ||
+        (clientMessageGuidValue &&
+         ![clientMessageGuidValue isKindOfClass:[NSString class]])) {
         return errorResponse(requestId, @"Invalid send-message parameter types");
     }
 
@@ -3494,9 +3639,23 @@ static NSDictionary *handleSendMessage(NSInteger requestId, NSDictionary *params
     BOOL ddScan = [ddScanNum boolValue];
     NSString *attributedBodyB64 = attributedBodyValue;
     NSArray *textFormatting = textFormattingValue;
+    NSString *clientMessageGuid = nil;
+    if (clientMessageGuidValue) {
+        NSUUID *clientUUID = [[NSUUID alloc] initWithUUIDString:clientMessageGuidValue];
+        if (!clientUUID) {
+            return errorResponse(requestId, @"clientMessageGuid must be a UUID");
+        }
+        if (!clientMessageGuidInitializerAvailable()) {
+            return errorResponse(requestId, @"Caller-owned message GUIDs are unavailable");
+        }
+        clientMessageGuid = clientUUID.UUIDString.lowercaseString;
+    }
 
     if (!chatGuid.length) return errorResponse(requestId, @"Missing chatGuid");
     if (!message) message = @"";
+    if (clientMessageGuid.length && richLinkPreview) {
+        return errorResponse(requestId, @"Caller-owned message GUIDs support text messages only");
+    }
     if (richLinkPreview &&
         (effectId.length || subject.length || selectedMessageGuid.length || partIndex != 0 ||
          attributedBodyB64.length || textFormatting.count || !ddScan)) {
@@ -3651,7 +3810,8 @@ static NSDictionary *handleSendMessage(NSInteger requestId, NSDictionary *params
                                        /*summaryInfo*/ nil,
                                        /*fileTransferGuids*/ @[],
                                        /*isAudio*/ NO,
-                                       ddScan);
+                                       ddScan,
+                                       clientMessageGuid);
         }
         if (!imMessage) {
             removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
@@ -3684,6 +3844,13 @@ static NSDictionary *handleSendMessage(NSInteger requestId, NSDictionary *params
                             withObject:threadIdentifier];
         }
 
+        if (clientMessageGuid.length && !reserveTrackedMessageGuid(clientMessageGuid)) {
+            return errorResponseWithDisposition(
+                requestId,
+                @"clientMessageGuid is already reserved by another tracked send",
+                @"not_started");
+        }
+
         if (gHasSendMessageReason && ddScan) {
             // Deferred-send path on macOS 13+: sleep 100ms, then call
             // `sendMessage:reason:` so the spam filter can run on the body.
@@ -3705,7 +3872,9 @@ static NSDictionary *handleSendMessage(NSInteger requestId, NSDictionary *params
         }
 
         // Best-effort messageGuid; not always available immediately.
-        NSString *guid = lastSentMessageGuid(chat);
+        NSString *guid = clientMessageGuid.length
+            ? clientMessageGuid
+            : lastSentMessageGuid(chat);
         NSMutableDictionary *response = [@{
             @"chatGuid": chatGuid,
             @"messageGuid": guid ?: @"",
@@ -4151,7 +4320,7 @@ static NSDictionary *handleSendMultipart(NSInteger requestId, NSDictionary *para
                                       parentItem,
                                       selectedMessageGuid, associatedType,
                                       NSMakeRange(0, body.length),
-                                      nil, @[], NO, NO);
+                                      nil, @[], NO, NO, nil);
         if (!imMessage) {
             return errorResponse(requestId, @"Could not construct multipart IMMessage");
         }
@@ -4250,18 +4419,18 @@ static int openUserOwnedDirectorySecurely(NSString *directoryPath,
         return -1;
     }
 
-    NSString *home = [actualUserHomeDirectory() stringByStandardizingPath];
-    if (!home.length || ![root hasPrefix:[home stringByAppendingString:@"/"]]) return -1;
-    int directoryFD = open(home.fileSystemRepresentation,
+    int directoryFD = open(root.fileSystemRepresentation,
                            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
     if (directoryFD < 0) return -1;
-    struct stat homeInfo = {0};
-    if (fstat(directoryFD, &homeInfo) != 0 || !S_ISDIR(homeInfo.st_mode)
-        || homeInfo.st_uid != getuid() || (homeInfo.st_mode & S_IWOTH)) {
+    struct stat rootInfo = {0};
+    if (fstat(directoryFD, &rootInfo) != 0 || !S_ISDIR(rootInfo.st_mode)
+        || rootInfo.st_uid != getuid() || (rootInfo.st_mode & S_IWOTH)) {
         close(directoryFD);
         return -1;
     }
-    NSString *relative = [directory substringFromIndex:home.length + 1];
+    if ([directory isEqualToString:root]) return directoryFD;
+
+    NSString *relative = [directory substringFromIndex:root.length + 1];
     NSArray<NSString *> *components = relative.pathComponents;
     for (NSString *component in components) {
         if ([component isEqualToString:@"."] || [component isEqualToString:@".."]
@@ -5074,7 +5243,7 @@ static NSDictionary *handleSendAttachment(NSInteger requestId, NSDictionary *par
                                       parentItem,
                                       selectedMessageGuid, associatedType,
                                       NSMakeRange(0, body.length), nil,
-                                      @[transferGuid], isAudio, NO);
+                                      @[transferGuid], isAudio, NO, nil);
         if (!imMessage) {
             return errorResponse(requestId, @"Could not build IMMessage with attachment");
         }
@@ -5309,7 +5478,7 @@ static NSDictionary *handleSendSticker(NSInteger requestId, NSDictionary *params
                                       nil,
                                       associatedRef, associatedType,
                                       targetRange, summaryInfo,
-                                      @[transferGuid], NO, NO);
+                                      @[transferGuid], NO, NO, nil);
         if (!imMessage) {
             cleanupPreparedStickerPaths(snapshotPath, activePath);
             return errorResponse(requestId, @"Could not build sticker IMMessage");
@@ -5491,7 +5660,7 @@ static NSDictionary *handleSendReaction(NSInteger requestId, NSDictionary *param
                                       associatedType,
                                       targetRange,
                                       summary,
-                                      @[], NO, NO);
+                                      @[], NO, NO, nil);
         if (!imMessage) {
             return errorResponse(requestId, @"Could not build reaction IMMessage");
         }
@@ -6076,7 +6245,7 @@ static NSDictionary *handleCreateChat(NSInteger requestId, NSDictionary *params)
             id imMessage = buildIMMessage(body, nil, nil, nil, nil,
                                           nil, 0,
                                           NSMakeRange(0, body.length),
-                                          nil, @[], NO, NO);
+                                          nil, @[], NO, NO, nil);
             if (imMessage) {
                 dispatchIMMessageInChat(chat, imMessage, nil, nil);
                 messageGuid = lastSentMessageGuid(chat);
@@ -6578,7 +6747,10 @@ static NSDictionary* processV2Envelope(NSDictionary *envelope) {
     BOOL ok = [legacy[@"success"] boolValue];
     if (!ok) {
         NSString *errMsg = legacy[@"error"];
-        return errorResponseV2(uuid, errMsg ?: @"Unknown error");
+        NSString *disposition = legacy[@"delivery_disposition"];
+        return disposition.length
+            ? errorResponseV2WithDisposition(uuid, errMsg ?: @"Unknown error", disposition)
+            : errorResponseV2(uuid, errMsg ?: @"Unknown error");
     }
 
     NSMutableDictionary *data = [NSMutableDictionary dictionaryWithDictionary:legacy];
