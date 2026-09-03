@@ -12,12 +12,40 @@ import Foundation
 /// use), and some senders format it with internal dashes ("657-265"). It is
 /// deliberately restricted to digits and dashes, so alphanumeric codes (e.g.
 /// "7fpa1i") are not redacted — accepted as a known, rare miss.
+///
+/// **Every** keyword-adjacent token is redacted, not just the nearest one.
+/// Redacting a single token was a real leak, found by running this matcher
+/// over a live chat.db: it spends its one replacement on whichever token sits
+/// closest to a keyword, which is not always the secret. Two shapes from that
+/// corpus, both of which left the actual secret in the clear:
+///
+///     Citi card ending in [redacted]. … enter one-time passcode 082156.
+///     San Francisco, CA [redacted] / Smart lock code for front door: 26179
+///
+/// The card's last four and the ZIP won; the OTP and the door code survived.
+/// A message can also simply carry two codes ("Alarm Code for Legacy System:
+/// …" then "Alarm Code for Ring: …"), where the second was never considered.
+/// Redacting all matches costs some false positives on non-secrets, which is
+/// the right trade for a caller that asked for redaction in the first place.
 public enum SecurityCodeRedactor {
   public static let placeholder = "[redacted]"
 
   private static let keyword = "(?:code|pin|otp|passcode|authentication)"
   private static let token = "\\d[\\d\\-]{2,8}\\d"
   private static let windowChars = 60
+
+  /// Longest digit-and-dash run a candidate may sit inside before it is read
+  /// as a phone number rather than a code.
+  ///
+  /// This is what keeps redact-everything from mangling support numbers:
+  /// "Didn't request a code? Call 1-800-387-2331" puts a phone number one
+  /// keyword away with no digits in between, so it matches, and the token
+  /// pattern caps at ten characters — enough to chew "1-800-387" out of the
+  /// middle and leave "-2331" behind. Separator-formatted phone numbers run
+  /// 12–14 characters, while codes (including dashed ones like "657-265" and
+  /// the "G-123456" web-OTP prefix, whose run starts at the dash) stay at or
+  /// under ten.
+  private static let maximumRunLength = 10
 
   // The gap between keyword and token deliberately excludes digits. Without
   // that restriction, a real but unmatchable code right next to the keyword
@@ -39,11 +67,17 @@ public enum SecurityCodeRedactor {
     options: [.caseInsensitive]
   )
 
-  /// Returns `text` with the nearest code-shaped token next to a security-code
-  /// keyword replaced by `placeholder`, or `text` unchanged if nothing matched.
+  /// Returns `text` with every code-shaped token adjacent to a security-code
+  /// keyword replaced by `placeholder`, or `text` unchanged if none matched.
   public static func redact(_ text: String) -> String {
-    guard let range = bestMatchRange(in: text) else { return text }
-    return (text as NSString).replacingCharacters(in: range, with: placeholder)
+    let ranges = redactionRanges(in: text)
+    guard !ranges.isEmpty else { return text }
+    let result = NSMutableString(string: text)
+    // Right to left, so each replacement leaves the earlier offsets valid.
+    for range in ranges.reversed() {
+      result.replaceCharacters(in: range, with: placeholder)
+    }
+    return result as String
   }
 
   public static func redact(_ text: String?) -> String? {
@@ -51,53 +85,51 @@ public enum SecurityCodeRedactor {
     return redact(text)
   }
 
-  private static func bestMatchRange(in text: String) -> NSRange? {
+  /// Token ranges to replace, ordered by position and free of overlaps.
+  private static func redactionRanges(in text: String) -> [NSRange] {
     let ns = text as NSString
     let full = NSRange(location: 0, length: ns.length)
-    guard full.length > 0 else { return nil }
+    guard full.length > 0 else { return [] }
     let urlRanges = url.matches(in: text, options: [], range: full).map { $0.range }
 
-    // Leftmost, URL-excluded match for a given direction. Stopping at the
-    // first valid match (rather than scanning every keyword occurrence in the
-    // message) matters: several real senders repeat "code" multiple times in
-    // one message (once naming the real code, again in a decoy like "didn't
-    // request a code? call 1-800-..."), and taking the first pairing reliably
-    // lands on the real code instead of a support phone number mentioned
-    // later near a second, unrelated "code".
-    func nearestValidMatch(_ regex: NSRegularExpression, tokenGroup: Int, gapGroup: Int) -> (
-      gap: Int, range: NSRange
-    )? {
-      var offset = 0
-      while offset < full.length {
-        let searchRange = NSRange(location: offset, length: full.length - offset)
-        guard let match = regex.firstMatch(in: text, options: [], range: searchRange) else {
-          return nil
-        }
+    var found: [NSRange] = []
+    for (regex, tokenGroup) in [(forward, 2), (backward, 1)] {
+      for match in regex.matches(in: text, options: [], range: full) {
         let tokenRange = match.range(at: tokenGroup)
-        let overlapsURL = urlRanges.contains {
-          NSIntersectionRange($0, tokenRange).length > 0
-        }
-        if overlapsURL {
-          offset = match.range.location + max(match.range.length, 1)
-          continue
-        }
-        return (match.range(at: gapGroup).length, tokenRange)
+        guard tokenRange.location != NSNotFound else { continue }
+        // A code quoted inside a link is part of the URL, not a separate
+        // secret; rewriting it would corrupt the link for no benefit.
+        guard !urlRanges.contains(where: { NSIntersectionRange($0, tokenRange).length > 0 })
+        else { continue }
+        guard runLength(in: ns, containing: tokenRange) <= maximumRunLength else { continue }
+        found.append(tokenRange)
       }
-      return nil
     }
 
-    let fwd = nearestValidMatch(forward, tokenGroup: 2, gapGroup: 1)
-    let bwd = nearestValidMatch(backward, tokenGroup: 1, gapGroup: 2)
-
-    switch (fwd, bwd) {
-    case (let f?, let b?):
-      return f.gap <= b.gap ? f.range : b.range
-    case (let f?, nil):
-      return f.range
-    case (nil, let b?):
-      return b.range
-    case (nil, nil):
-      return nil
+    // The two directions can flag the same token ("code 1234 code"), so merge
+    // before replacing — overlapping replacements would corrupt the output.
+    found.sort { $0.location < $1.location }
+    var merged: [NSRange] = []
+    for range in found {
+      if let last = merged.last, NSMaxRange(last) > range.location {
+        merged[merged.count - 1] = NSUnionRange(last, range)
+      } else {
+        merged.append(range)
+      }
     }
+    return merged
+  }
+
+  /// Length of the maximal digit-and-dash run that `range` sits inside.
+  private static func runLength(in ns: NSString, containing range: NSRange) -> Int {
+    var start = range.location
+    while start > 0, isDigitOrDash(ns.character(at: start - 1)) { start -= 1 }
+    var end = NSMaxRange(range)
+    while end < ns.length, isDigitOrDash(ns.character(at: end)) { end += 1 }
+    return end - start
+  }
+
+  private static func isDigitOrDash(_ character: unichar) -> Bool {
+    (character >= 0x30 && character <= 0x39) || character == 0x2D
   }
 }

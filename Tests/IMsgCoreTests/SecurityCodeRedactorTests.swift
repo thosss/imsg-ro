@@ -120,10 +120,60 @@ func doesNotRedactUnrelatedMessage() {
 }
 
 @Test
-func onlyRedactsClosestOccurrenceNotEveryDigitRun() {
+func doesNotRedactPhoneNumberSeparatedFromKeywordByDigits() {
+  // Two guards keep the support number intact now that every match is
+  // redacted: digits in the keyword-to-token gap end the match, and the
+  // number's 12-character digit-and-dash run is longer than a code's.
   let text = "Free Msg: Enter code 104414 to activate your Wallet. Contact us at 800-945-3114."
   let result = SecurityCodeRedactor.redact(text)
   #expect(
     result == "Free Msg: Enter code [redacted] to activate your Wallet. Contact us at 800-945-3114."
   )
+}
+
+// MARK: - Multiple codes in one message
+//
+// Every case below is a real message shape from a live chat.db. Under the old
+// single-replacement rule each one leaked: the first three left the actual
+// secret in the clear, because the token nearest a keyword was not the secret.
+
+@Test
+func redactsOTPEvenWhenCardDigitsSitNearerTheKeyword() {
+  let text =
+    "BEWARE DO NOT GIVE THIS CODE TO ANYONE. Citi card ending in 8940. "
+    + "For online purchase of (EUR) 0.00 with EUROSTARS GRAND CENTRAL enter one-time passcode 082156."
+  let result = SecurityCodeRedactor.redact(text)
+  #expect(!result.contains("082156"), "the one-time passcode must not survive")
+  #expect(!result.contains("8940"))
+}
+
+@Test
+func redactsDoorCodeEvenWhenZIPSitsNearerTheKeyword() {
+  let text =
+    "My address\n4057 19th Street\nSan Francisco, CA 94114\n\nSmart lock code for front door: 26179"
+  let result = SecurityCodeRedactor.redact(text)
+  #expect(!result.contains("26179"), "the door code must not survive")
+  #expect(!result.contains("94114"))
+  // The street number is not keyword-adjacent, so it is left alone.
+  #expect(result.contains("4057 19th Street"))
+}
+
+@Test
+func redactsBothCodesWhenAMessageCarriesTwo() {
+  let text =
+    "Alarm Code for Legacy System (panel on wall): 3333 enter\n"
+    + "Alarm Code for Ring (panel is on the stairs): 4444 disarm button"
+  let result = SecurityCodeRedactor.redact(text)
+  #expect(!result.contains("3333"))
+  #expect(!result.contains("4444"), "the second code must not survive")
+  #expect(result.components(separatedBy: "[redacted]").count == 3)
+}
+
+@Test
+func leavesDashedPhoneNumberWholeRatherThanChewingItsMiddle() {
+  // The token pattern caps at ten characters, so without the run-length guard
+  // "888-725" would be redacted out of the middle, leaving a stray "-7020".
+  let text = "Tap the link or call 888-725-7020 & zip code, or reply STOP."
+  let result = SecurityCodeRedactor.redact(text)
+  #expect(result == text)
 }
