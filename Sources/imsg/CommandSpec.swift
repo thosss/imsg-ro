@@ -17,14 +17,14 @@ enum MutationPolicy: Sendable {
   case conditional(@Sendable (ParsedValues) -> Bool)
 }
 
-struct CommandSpec: @unchecked Sendable {
+struct CommandSpec: Sendable {
   let name: String
   let abstract: String
   let discussion: String?
   let signature: CommandSignature
   let usageExamples: [String]
   let mutation: MutationPolicy
-  let run: (ParsedValues, RuntimeOptions) async throws -> Void
+  let run: @Sendable (ParsedValues, RuntimeOptions) async throws -> Void
 
   init(
     name: String,
@@ -33,7 +33,7 @@ struct CommandSpec: @unchecked Sendable {
     signature: CommandSignature,
     usageExamples: [String],
     mutation: MutationPolicy = .write,
-    run: @escaping (ParsedValues, RuntimeOptions) async throws -> Void
+    run: @escaping @Sendable (ParsedValues, RuntimeOptions) async throws -> Void
   ) {
     self.name = name
     self.abstract = abstract

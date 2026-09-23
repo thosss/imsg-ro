@@ -71,11 +71,12 @@ struct CommandRouter {
 
   func run(argv: [String]) async -> Int32 {
     let argv = normalizeArguments(argv)
-    if argv.contains("--version") || argv.contains("-V") {
+    let options = argv.prefix { $0 != "--" }
+    if options.contains("--version") || options.contains("-V") {
       StdoutWriter.writeLine(version)
       return 0
     }
-    if argv.count <= 1 || argv.contains("--help") || argv.contains("-h") {
+    if argv.count <= 1 || options.contains("--help") || options.contains("-h") {
       printHelp(for: argv)
       return 0
     }
@@ -83,12 +84,14 @@ struct CommandRouter {
     let (readOnly, redactCodes, resolveArgv) = CommandRouter.extractLeadingGlobalFlags(argv)
 
     do {
-      let invocation = try program.resolve(argv: resolveArgv)
+      let invocation = try program.resolve(arguments: resolveArgv)
       guard let commandName = invocation.path.last,
         let spec = specs.first(where: { $0.name == commandName })
       else {
-        StdoutWriter.writeLine("Unknown command")
-        HelpPrinter.printRoot(version: version, rootName: rootName, commands: specs)
+        writeDiagnostic("Unknown command")
+        writeDiagnostic(
+          HelpPrinter.renderRoot(version: version, rootName: rootName, commands: specs).joined(
+            separator: "\n"))
         return 1
       }
       let runtime = RuntimeOptions(
@@ -97,25 +100,22 @@ struct CommandRouter {
         emitReadOnlyDenial(command: commandName, json: runtime.jsonOutput)
         return CommandRouter.readOnlyExitCode
       }
-      do {
-        try await spec.run(invocation.parsedValues, runtime)
-        return 0
-      } catch is BridgeOutput.EmittedError {
-        return 1
-      } catch is CommandOutputEmittedError {
-        return 1
-      } catch {
-        StdoutWriter.writeLine(String(describing: error))
-        return 1
-      }
+      try await spec.run(invocation.parsedValues, runtime)
+      return 0
+    } catch is BridgeOutput.EmittedError {
+      return 1
+    } catch is CommandOutputEmittedError {
+      return 1
     } catch let error as CommanderProgramError {
-      StdoutWriter.writeLine(error.description)
+      writeDiagnostic(error.description)
       if case .missingSubcommand = error {
-        HelpPrinter.printRoot(version: version, rootName: rootName, commands: specs)
+        writeDiagnostic(
+          HelpPrinter.renderRoot(version: version, rootName: rootName, commands: specs).joined(
+            separator: "\n"))
       }
       return 1
     } catch {
-      StdoutWriter.writeLine(String(describing: error))
+      writeDiagnostic(String(describing: error))
       return 1
     }
   }
@@ -191,6 +191,10 @@ struct CommandRouter {
     } else {
       StdoutWriter.writeLine(message)
     }
+  }
+
+  private func writeDiagnostic(_ message: String) {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
   }
 
   private func normalizeArguments(_ argv: [String]) -> [String] {

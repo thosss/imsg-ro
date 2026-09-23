@@ -96,7 +96,7 @@ fallback, while read retains IMCore bridge activation. Either may activate
 Messages.app. Direct AppleScript `send` may activate it too. Bridge-oriented
 CLI commands retain their documented launch behavior.
 
-The pattern intentionally mirrors language servers and the way `imsg`'s parent gateway (Clawdis) supervises subprocesses — a single signal-style child that exits cleanly when stdin closes.
+OpenClaw supervises `imsg` as a child process that exits cleanly when stdin closes.
 
 ## Read-only mode
 
@@ -181,6 +181,7 @@ Closing stdin stops admission, cancels and awaits every watch subscription,
 then drains all already accepted requests and flushes stdout before `run()`
 returns. Parent-task cancellation cancels subscriptions plus read/control work,
 but never cancels an already-started mutation or claims it did not execute.
+Overlapping shutdown and unsubscribe requests await the same subscription cleanup.
 Accepted mutations, including those not yet started, conservatively drain in
 FIFO order during normal EOF or parent cancellation; the server never invents
 a retry-safe result for work it already admitted.
@@ -263,7 +264,10 @@ When the database is ready, `database.features` exposes feature-level booleans,
 not raw SQLite column names. When it is down, `database.error` is redacted and
 actionable. `contacts.available` is refreshed during the child lifetime; a
 permission grant can become usable without restarting, while revocation clears
-cached contact data. Contact-backed sends normalize phone numbers using that
+cached contact data. Status reads the cached Contacts state and starts a background
+refresh when needed, so `contacts.available` may initially be false while the
+first catalog loads. A slow Contacts service does not delay the status response.
+Contact-backed sends normalize phone numbers using that
 request's `region`. A successful bridge probe additionally reports
 `bridge_version`, `v2_ready`, `registry_available`, and `selectors` supplied by
 the helper.
@@ -292,6 +296,9 @@ Params:
 - `text` (string, optional initial message)
 
 This bridge-backed method is iMessage-only, matching `imsg chat-create`.
+Previously uncontacted addresses are supported. All recipients must resolve and
+pass the bridge's IDS availability check before chat creation; failures identify
+an unreachable or unresolved address and do not create a partial group.
 
 ### `messages.stats`
 
@@ -357,6 +364,8 @@ Result:
 ```
 
 Search results always contain an empty `attachments` array.
+Matching is case-insensitive for Unicode text and uses the text shown by history, including attributed bodies and stored audio transcripts. Characters such as `%`, `_`, and `\` are matched literally.
+Across all-chat search and cursor reads, each physical message appears once. If Messages links it to multiple chats, `chat_id` is the lowest linked chat ID. An explicit chat filter preserves that chat's context.
 
 ### `messages.after`
 
@@ -422,7 +431,7 @@ Older Messages database schemas without scheduling columns return an invalid-par
 Params:
 
 - `chat_id` (int, optional) — omit for all-chat stream.
-- `since_rowid` (int, optional) — exclusive cursor.
+- `since_rowid` (int, optional) — positive values resume exclusively after that row; omitted or `0` starts at the current tail. Use `-1` to replay from the beginning.
 - `participants` (array, optional)
 - `start` / `end` (ISO 8601, optional)
 - `attachments` (bool, default `false`)
@@ -454,6 +463,13 @@ Notifications (one per emitted message):
 The RPC default debounce (`500ms`) is intentionally higher than the CLI default (`250ms`). RPC's typical caller is an agent that just sent a message and is waiting for the inbound echo to settle (`is_from_me` correction, attachment metadata, …). 500ms is enough for those follow-ups to land before the message is emitted.
 
 Like the CLI watch, RPC watch backs filesystem events with a low-frequency poll so a missed event or a rotated SQLite sidecar doesn't leave the subscription silent.
+
+Contact names use the last available catalog while Contacts refreshes in the
+background. Until the first refresh succeeds, `sender_name` can be absent even
+with Contacts permission. A stalled Contacts read does not delay message
+notifications; message timestamps and resumable cursors retain their original
+values. Explicit contact searches and name-based sends still wait for a fresh
+catalog when needed.
 
 The server permits at most 64 pending or active subscriptions. A 65th
 identified subscribe request receives `-32000` (`Server busy`). The subscribe
@@ -678,8 +694,9 @@ existing iMessage chat; ordinary `send.rich` text does not.
 
 - `send.rich` sends text with optional `effect`, `subject`, `reply_to`, `part_index`, `dd_scan`, and `text_formatting`. It also accepts `file` or `path` and securely stages the file before sending it through the attachment bridge while preserving those same caption/effect/subject/reply/part/formatting semantics. Attachment capability is checked before staging or publishing the send. Alternatively, pass only one chat target plus an HTTP(S) `url` to send an Apple URL-preview balloon. URL mode is iMessage-only and rejects text, file, and other send modifiers; metadata or image lookup failure falls back to a metadata-only card, never a plain-message send.
 - `send.attachment` sends `file` or `path`, with optional `audio` / `is_audio` / `as_voice`. Pass `reply_to` (or `replyTo`, `reply_to_guid`, or `message_guid`) to reply to an existing message. An optional non-negative integer `part_index` / `partIndex` selects that message's part and is invalid without a reply target.
+  When audio is true, imsg prepares a CAF/Opus voice message with macOS's built-in `afconvert` before dispatch. Invalid audio fails without sending; the original file is unchanged. See [native voice messages](attachments.md#native-voice-messages).
 - `send.multipart` sends 1–20 text parts. `parts` is a required array of objects containing a non-empty `text` string and optional `text_formatting` array. Top-level `effect` / `effect_id` and `subject` match `imsg send-multipart`. File, attachment, and mention parts are rejected before bridge dispatch.
-- `tapback` sends or removes a reaction. Params: `message_id` or `message_guid`, plus `reaction` / `kind` / `emoji`, optional `remove`.
+- `tapback` sends or removes a standard reaction. Params: `message_id` or `message_guid`, plus `reaction` / `kind` / `emoji`, optional `remove` and non-negative `part_index`. A `p:N/GUID` target selects its embedded part; the reference and native range always refer to that same part.
 - `message.edit` edits `message_id` / `message_guid` with `text`.
 - `message.unsend`, `message.delete`, and `message.notifyAnyways` target `message_id` / `message_guid`.
 - `contacts.shouldShareContact` reads Apple Messages' advisory Name & Photo offer eligibility. The result includes `can_inspect_offer`, `can_share`, and tri-state `should_offer`.
@@ -702,6 +719,10 @@ unobserved result is reported as delivery outcome unknown (`-32001`) and must
 not be retried automatically. Existing `send.rich` text/URL mode and
 `send.attachment` return `guid` / `message_id` and `chat_guid` when available.
 `send.multipart` additionally returns `parts_count`.
+
+### `group.setIcon`
+
+Updates the selected group's photo through the bridge. It accepts exactly one chat selector and an optional `file` path. Photo files are securely staged like other attachments: symlink components are rejected and the caller needs write access to Messages' attachment staging directory. Omitting `file` clears the photo without staging. A staging failure is reported as `not_started`, before bridge dispatch. See [group-photo requirements](bridge.md#message-and-chat-mutation).
 
 ### `handles.check`
 
@@ -743,16 +764,22 @@ With a caption override:
 {"jsonrpc":"2.0","id":"poll","method":"poll.send","params":{"chat_id":42,"question":"Dinner?","comment":"Vote by 5pm","options":["Pizza","Sushi"]}}
 ```
 
+Response to either of the two requests above, which do send a caption:
+
+```json
+{"ok":true,"event":"imessage.poll.created","guid":"...","message_id":"...","comment":{"requested":true,"sent":true,"verified":true},"poll":{"kind":"created","event":"imessage.poll.created","question":"Dinner?","options":[{"id":"...","text":"Pizza"},{"id":"...","text":"Sushi"}]}}
+```
+
 Without a caption:
 
 ```json
 {"jsonrpc":"2.0","id":"poll","method":"poll.send","params":{"chat_id":42,"question":"Dinner?","suppress_comment":true,"options":["Pizza","Sushi"]}}
 ```
 
-Response:
+That request suppresses the caption, so its response reports it as never requested:
 
 ```json
-{"ok":true,"event":"imessage.poll.created","guid":"...","message_id":"...","poll":{"kind":"created","event":"imessage.poll.created","question":"Dinner?","options":[{"id":"...","text":"Pizza"},{"id":"...","text":"Sushi"}]}}
+{"ok":true,"event":"imessage.poll.created","guid":"...","message_id":"...","comment":{"requested":false,"sent":false},"poll":{"kind":"created","event":"imessage.poll.created","question":"Dinner?","options":[{"id":"...","text":"Pizza"},{"id":"...","text":"Sushi"}]}}
 ```
 
 `poll.vote` casts a native vote after validating the poll and option against local history.
@@ -768,7 +795,23 @@ it must reconstruct the caller's currently selected options.
 {"jsonrpc":"2.0","id":"unvote","method":"polls.unvote","params":{"chat_id":42,"poll_guid":"POLL-GUID","option":"Sushi"}}
 ```
 
-`messages.poll.send` is accepted as an alias for `poll.send`. The caption echo is deliberately best-effort: if the poll is created but the follow-up caption send fails, the RPC still returns the poll result to avoid retrying and creating a duplicate poll.
+`messages.poll.send` is accepted as an alias for `poll.send`. The caption echo is deliberately best-effort: if the poll is created but the follow-up caption send fails, the RPC still returns the poll result with `ok: true` to avoid retrying and creating a duplicate poll.
+
+Because the balloon shows no question without it, the caption's outcome is reported in the result under `comment`:
+
+| Field | Meaning |
+| --- | --- |
+| `message_guid` | Caption message GUID when returned by the bridge; use it with `message.send_status` to check again later. Omitted when unavailable. |
+| `requested` | Whether a caption was supposed to be sent (`false` for `suppress_comment: true`). |
+| `sent` | Tri-state delivery result: `true` means delivered, `false` means confirmed not delivered, and `null` means delivery is unknown. A bare bridge acknowledgement is never reported as `true`. |
+| `verified` | Whether Messages recorded the caption as delivered in the target chat. `false` can mean a recorded failure or a row that was absent, pending, or only locally sent at the deadline; use `sent` to distinguish confirmed failure from unknown delivery. Absent when the check could not run at all. |
+| `error` | Failure or unresolved-delivery diagnostic. Typed transport failures are redacted. |
+| `disposition` | `not_started`, `may_have_completed`, or `still_in_flight`. Transport failures supply this directly; verification timeout conservatively synthesizes `may_have_completed`. |
+| `retry_safe` | Whether re-sending the caption is safe. Transport failures supply this directly; verification timeout synthesizes `false`. Never infer it by matching `error`. |
+
+After the caption bridge call completes, RPC polls its delivery for up to two seconds while holding the serialized mutation lane. Database work is additional to that polling bound. Unknown delivery retains the caption GUID when available so a later `message.send_status` query can resolve it without another send. Captions are plain messages, not threaded replies to the poll.
+
+Retry the caption text only when `retry_safe` is `true`, which means the transport proved the operation did not start. `sent: null` is delivery-unknown: the caption may still arrive, so do not retry automatically. Never re-run `poll.send` to recover a caption because that would duplicate the poll balloon.
 
 ### Stickers
 

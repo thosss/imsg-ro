@@ -48,9 +48,13 @@ enum StatusCommand {
     try await run(values: values, runtime: runtime)
   }
 
-  static func run(values: ParsedValues, runtime: RuntimeOptions) async throws {
-    let bridge = IMCoreBridge.shared
-    let availability = bridge.checkAvailability()
+  static func run(
+    values: ParsedValues, runtime: RuntimeOptions,
+    availability: (available: Bool, message: String) = IMCoreBridge.shared.checkAvailability(),
+    probe: () async throws -> [String: Any] = {
+      try await IMsgBridgeClient.shared.invoke(action: .status, params: [:], timeout: 3.0)
+    }
+  ) async throws {
     let sipStatus: String = {
       switch MessagesLauncher.currentSIPStatus() {
       case .enabled:
@@ -66,29 +70,62 @@ enum StatusCommand {
     var bridgeVersion: Int = 0
     var v2Ready: Bool = false
     var selectors: [String: Bool] = [:]
+    var helperVersion: String?
+    var helperResponded = false
+    var unresponsiveMessage: String?
     if availability.available {
       do {
-        let data = try await IMsgBridgeClient.shared.invoke(
-          action: .status, params: [:], timeout: 3.0)
+        let data = try await probe()
+        helperResponded = true
         bridgeVersion = (data["bridge_version"] as? Int) ?? 0
         v2Ready = (data["v2_ready"] as? Bool) ?? false
+        helperVersion = data["helper_version"] as? String
         if let raw = data["selectors"] as? [String: Bool] { selectors = raw }
+      } catch IMsgBridgeError.timeout {
+        unresponsiveMessage = """
+          The IMCore bridge is not responding.
+          Messages.app may be running with a stale or hung helper.
+          Re-inject it with `imsg launch`.
+          """
       } catch {
-        // Bridge probe failure is non-fatal.
+        // Reply errors and prepublication failures do not establish a hung helper.
       }
     }
+
+    let advancedAvailable = availability.available && unresponsiveMessage == nil
+
+    // A dylib injected by an older release keeps answering pings forever
+    // (Messages.app stays up for weeks), so a CLI upgrade alone does not
+    // update the bridge. Surface the mismatch instead of failing deep inside
+    // feature requests with confusing RPC errors.
+    let helperVersionMismatch: String? = {
+      guard helperResponded, helperVersion != IMsgVersion.current else { return nil }
+      guard let helperVersion else {
+        return """
+          The injected bridge dylib predates release version reporting. Run `imsg launch` \
+          to relaunch Messages.app with the current dylib.
+          """
+      }
+      return """
+        The injected bridge dylib reports version \(helperVersion), but this CLI is \
+        \(IMsgVersion.current). Run `imsg launch` to relaunch Messages.app with the \
+        current dylib.
+        """
+    }()
 
     if runtime.jsonOutput {
       let payload = StatusPayload(
         version: IMsgVersion.current,
         basicFeatures: true,
-        advancedFeatures: availability.available,
-        typingIndicators: availability.available,
-        readReceipts: availability.available,
+        advancedFeatures: advancedAvailable,
+        typingIndicators: advancedAvailable,
+        readReceipts: advancedAvailable,
         sip: sipStatus,
-        message: availability.message,
+        message: unresponsiveMessage ?? availability.message,
         bridgeVersion: bridgeVersion,
         v2Ready: v2Ready,
+        helperVersion: helperVersion,
+        helperVersionMismatch: helperVersionMismatch,
         selectors: selectors,
         rpcMethods: advertisedRPCMethods(selectors: selectors, readOnly: runtime.readOnly),
         readOnly: runtime.readOnly,
@@ -119,10 +156,22 @@ enum StatusCommand {
       StdoutWriter.writeLine("  \(sipStatus)")
       StdoutWriter.writeLine("")
       StdoutWriter.writeLine("Advanced features (typing, read receipts):")
-      if availability.available {
+      if let unresponsiveMessage {
+        StdoutWriter.writeLine("  Unavailable - IMCore bridge is not responding")
+        for line in unresponsiveMessage.split(separator: "\n") {
+          StdoutWriter.writeLine("  \(line)")
+        }
+      } else if advancedAvailable {
         StdoutWriter.writeLine("  Available - IMCore bridge connected")
         StdoutWriter.writeLine(
           "  bridge version: v\(bridgeVersion)\(v2Ready ? " (v2 inbox active)" : "")")
+        if let helperVersion {
+          StdoutWriter.writeLine("  helper dylib version: \(helperVersion)")
+        }
+        if let mismatch = helperVersionMismatch {
+          StdoutWriter.writeLine("")
+          StdoutWriter.writeLine("  WARNING: \(mismatch)")
+        }
         if !selectors.isEmpty {
           StdoutWriter.writeLine("  selectors:")
           for key in selectors.keys.sorted() {
@@ -184,6 +233,8 @@ private struct StatusPayload: Encodable {
   let message: String
   let bridgeVersion: Int
   let v2Ready: Bool
+  let helperVersion: String?
+  let helperVersionMismatch: String?
   let selectors: [String: Bool]
   let rpcMethods: [String]
   let readOnly: Bool
@@ -199,6 +250,8 @@ private struct StatusPayload: Encodable {
     case message
     case bridgeVersion = "bridge_version"
     case v2Ready = "v2_ready"
+    case helperVersion = "helper_version"
+    case helperVersionMismatch = "helper_version_mismatch"
     case selectors
     case rpcMethods = "rpc_methods"
     case readOnly = "read_only"

@@ -256,9 +256,8 @@ func configuredStoreRedactsEveryMessageReadPath() throws {
 
   // The watch paths (CLI and RPC) no longer redact for themselves — they poll
   // through MessageWatcher, whose only read is this batch method.
-  var dedupe = URLBalloonDedupeState()
   let batch = try store.messagesAfterBatch(
-    afterRowID: 0, chatID: nil, limit: 5, includeReactions: false, dedupeState: &dedupe)
+    afterRowID: 0, chatID: nil, limit: 5, includeReactions: false)
   #expect(batch.messages.first?.text == expected)
 }
 

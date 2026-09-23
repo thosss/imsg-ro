@@ -1,0 +1,273 @@
+import Foundation
+import IMsgCore
+
+private enum RPCSendTransport: String {
+  case auto
+  case bridge
+  case applescript
+
+  static func parse(_ raw: String?) throws -> RPCSendTransport {
+    let value = raw?.lowercased() ?? "auto"
+    guard let transport = RPCSendTransport(rawValue: value) else {
+      throw RPCError.invalidParams("invalid transport")
+    }
+    return transport
+  }
+}
+
+extension RPCServer {
+  func handleSend(params: [String: Any], id: Any?) async throws {
+    try await handleSend(params: params, id: id, tracked: false)
+  }
+
+  func handleSendTracked(params: [String: Any], id: Any?) async throws {
+    try await handleSend(params: params, id: id, tracked: true)
+  }
+
+  private func handleSend(params: [String: Any], id: Any?, tracked: Bool) async throws {
+    let supportedKeys = RPCParameterKeys.combining(
+      RPCParameterKeys.chatTarget,
+      RPCParameterKeys.replyTarget,
+      [
+        "to", "text", "file", "text_formatting", "textFormatting", "formatting", "service",
+        "transport", "region", "allow_sms_fallback", "allowSMSFallback",
+        "attempt_id",
+      ]
+    )
+    let method = tracked ? "send.tracked" : "send"
+    let params = try RPCParameters(params, method: method, supportedKeys: supportedKeys)
+    let text = try params.string("text") ?? ""
+    let file = try params.string("file") ?? ""
+    let attemptID: String?
+    if tracked {
+      guard let rawAttemptID = try params.string("attempt_id"),
+        let uuid = UUID(uuidString: rawAttemptID)
+      else {
+        throw RPCError.invalidParams("attempt_id must be a UUID")
+      }
+      attemptID = uuid.uuidString.lowercased()
+    } else {
+      guard try params.string("attempt_id") == nil else {
+        throw RPCError.invalidParams("attempt_id is only supported by send.tracked")
+      }
+      attemptID = nil
+    }
+    // Optional attributed-text formatting (bold/italic/…, macOS 15+). Only the
+    // IMCore bridge transport can render it; AppleScript sends stay plain.
+    // Accept `text_formatting`/`textFormatting` (matching `send-rich`) plus the
+    // bare `formatting` key that the OpenClaw gateway emits on its `send` calls.
+    let textFormatting = try params.objectArray(
+      "text_formatting", aliases: ["textFormatting", "formatting"])
+    let serviceRaw = try params.string("service") ?? "auto"
+    guard let service = MessageService(rawValue: serviceRaw) else {
+      throw RPCError.invalidParams("invalid service")
+    }
+    let transport = try RPCSendTransport.parse(try params.string("transport"))
+    let region = try params.string("region") ?? "US"
+    let requestedSMSFallback =
+      try params.boolean("allow_sms_fallback", aliases: ["allowSMSFallback"]) ?? true
+    let requestContacts =
+      (contactResolver as? ContactResolver)?.resolver(region: region) ?? contactResolver
+    let selectedMessageGuid = try params.string(
+      "reply_to", aliases: ["replyTo", "reply_to_guid", "message_guid"]
+    ).flatMap { $0.isEmpty ? nil : $0 }
+    let rawInput = try params.recipientOrChatTarget()
+    let rawRecipient = rawInput.recipient
+    let resolvedRecipient: String
+    do {
+      resolvedRecipient =
+        rawInput.hasChatTarget || rawRecipient.isEmpty
+        ? rawRecipient
+        : try ChatTargetResolver.resolveRecipientName(rawRecipient, contacts: requestContacts)
+    } catch {
+      throw RPCError.invalidParams(error.localizedDescription)
+    }
+    let recipient = MessageSender().normalizedRecipient(resolvedRecipient, region: region)
+    let input = ChatTargetInput(
+      recipient: recipient,
+      chatID: rawInput.chatID,
+      chatIdentifier: rawInput.chatIdentifier,
+      chatGUID: rawInput.chatGUID
+    )
+
+    if text.isEmpty && file.isEmpty {
+      throw RPCError.invalidParams("text or file is required")
+    }
+    if tracked && (text.isEmpty || !file.isEmpty) {
+      throw RPCError.invalidParams("send.tracked supports exactly one text message")
+    }
+    if tracked && transport == .applescript {
+      throw RPCError.invalidParams("send.tracked requires bridge transport")
+    }
+
+    let database: RPCDatabaseResources?
+    if tracked {
+      let required = try await databaseResources.require()
+      if let attemptID, try required.store.messageSendStatus(guid: attemptID) != nil {
+        throw DeliveryFailure(
+          disposition: .notStarted,
+          transport: .bridgeV2,
+          operation: BridgeAction.sendMessage.rawValue,
+          detail: "attempt_id already identifies a message; choose a new UUID"
+        )
+      }
+      database = required
+    } else if input.chatID != nil {
+      database = try await databaseResources.require()
+    } else {
+      database = await databaseResources.available()
+    }
+
+    let resolvedTarget = try await ChatTargetResolver.resolveChatTarget(
+      input: input,
+      lookupChat: { chatID in try database?.store.chatInfo(chatID: chatID) },
+      unknownChatError: { chatID in
+        RPCError.invalidParams("unknown chat_id \(chatID)")
+      }
+    )
+    if input.hasChatTarget && resolvedTarget.preferredIdentifier == nil {
+      throw RPCError.invalidParams("missing chat identifier or guid")
+    }
+    var effectiveService = service
+    if service == .auto && !input.hasChatTarget && !input.recipient.isEmpty {
+      switch (try? database?.store.preferredService(forHandle: input.recipient, region: region))
+        ?? .unknown
+      {
+      case .imessage, .unknown:
+        effectiveService = .auto
+      case .sms:
+        effectiveService = .sms
+      }
+    }
+
+    let directChatInfo =
+      input.hasChatTarget
+      ? nil
+      : try database.map {
+        try ChatTargetResolver.existingDirectChat(
+          store: $0.store,
+          recipient: input.recipient,
+          service: effectiveService,
+          includeAnyForSMS: service == .auto && effectiveService == .sms
+        )
+      } ?? nil
+
+    let allowSMSFallback =
+      requestedSMSFallback
+      && service == .auto
+      && !input.hasChatTarget
+      && !input.recipient.isEmpty
+      && !text.isEmpty
+      && file.isEmpty
+
+    let options = MessageSendOptions(
+      recipient: input.recipient,
+      text: text,
+      attachmentPath: file,
+      service: effectiveService,
+      region: region,
+      chatIdentifier: input.hasChatTarget ? resolvedTarget.chatIdentifier : "",
+      chatGUID: input.hasChatTarget ? resolvedTarget.chatGUID : (directChatInfo?.guid ?? ""),
+      allowSMSFallback: allowSMSFallback,
+      directParticipantTarget: ChatTargetResolver.directParticipantTarget(
+        store: database?.store, resolvedTarget: resolvedTarget, directChatInfo: directChatInfo)
+    )
+    let sentAt = Date()
+
+    if let bridgeChatGUID = bridgeChatGUID(
+      resolvedTarget: resolvedTarget, directChatInfo: directChatInfo),
+      transport != .applescript,
+      transport == .bridge || isBridgeReady()
+    {
+      do {
+        let data = try await sendViaBridge(
+          chatGUID: bridgeChatGUID,
+          text: text,
+          file: file,
+          selectedMessageGuid: selectedMessageGuid,
+          textFormatting: textFormatting,
+          clientMessageGuid: attemptID
+        )
+        var result: [String: Any] = ["ok": true, "transport": "bridge"]
+        if let guid = data["messageGuid"] as? String, !guid.isEmpty {
+          result["guid"] = guid
+          result["message_id"] = guid
+        }
+        if let chatGuid = data["chatGuid"] as? String, !chatGuid.isEmpty {
+          result["chat_guid"] = chatGuid
+        }
+        if let service = data["service"] as? String, !service.isEmpty {
+          result["service"] = service
+        }
+        if let attemptID {
+          result["attempt_id"] = attemptID
+        }
+        respond(id: id, result: result)
+        return
+      } catch let failure as DeliveryFailure {
+        if tracked || transport == .bridge || selectedMessageGuid != nil || !failure.retrySafe {
+          throw failure
+        }
+      } catch let err as RPCError {
+        if tracked || transport == .bridge || selectedMessageGuid != nil {
+          throw err
+        }
+      } catch {
+        throw RPCError.internalError(String(describing: error))
+      }
+    } else if tracked || transport == .bridge {
+      throw RPCError.invalidParams("bridge transport requires an existing chat target")
+    } else if selectedMessageGuid != nil {
+      throw RPCError.invalidParams(
+        "reply_to requires bridge transport; AppleScript fallback cannot send threaded replies"
+      )
+    }
+
+    let sentOptions = try sendMessage(options)
+
+    let sentMessage: Message?
+    let verificationChatID =
+      database.flatMap {
+        try? SentMessageVerifier.verificationChatID(store: $0.store, options: sentOptions)
+      }
+    if let database, input.hasChatTarget || !text.isEmpty {
+      sentMessage = try await SentMessageVerifier.verifyAppleScriptSend(
+        store: database.store,
+        options: sentOptions,
+        chatID: verificationChatID,
+        sentAt: sentAt,
+        resolve: resolveSentMessage
+      )
+    } else {
+      sentMessage = nil
+    }
+    var result: [String: Any] = ["ok": true, "transport": "applescript"]
+    if let sentMessage {
+      result["id"] = sentMessage.rowID
+      if !sentMessage.guid.isEmpty {
+        result["guid"] = sentMessage.guid
+        result["message_id"] = sentMessage.guid
+      }
+    }
+    if let sentMessage, !sentMessage.service.isEmpty { result["service"] = sentMessage.service }
+    if let chatID = sentMessage?.chatID ?? verificationChatID,
+      let chatInfo = try? database?.store.chatInfo(chatID: chatID)
+    {
+      if !chatInfo.guid.isEmpty { result["chat_guid"] = chatInfo.guid }
+      if result["service"] == nil && !chatInfo.service.isEmpty {
+        result["service"] = chatInfo.service
+      }
+    }
+    if result["chat_guid"] == nil && !sentOptions.chatGUID.isEmpty {
+      result["chat_guid"] = sentOptions.chatGUID
+    }
+    if result["service"] == nil && sentOptions.service != .auto {
+      result["service"] = sentOptions.service == .sms ? "SMS" : "iMessage"
+    }
+    respond(id: id, result: result)
+  }
+
+  /// `typing` — start/stop the local-user typing indicator. Mirrors the
+  /// `imsg typing` CLI surface (which is purely a wrapper over `TypingIndicator`)
+  /// so callers that talk to `imsg rpc` over JSON-RPC have parity with the CLI.
+}

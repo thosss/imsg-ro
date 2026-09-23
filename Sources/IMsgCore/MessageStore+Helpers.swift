@@ -26,36 +26,6 @@ extension MessageStore {
       && columns.contains("associated_message_type")
   }
 
-  static func detectReactionColumns(connection: Connection) -> Bool {
-    let columns = (try? tableColumns(connection: connection, table: "message")) ?? []
-    return reactionColumnsPresent(in: columns)
-  }
-
-  static func detectThreadOriginatorGUIDColumn(connection: Connection) -> Bool {
-    return (try? tableColumns(connection: connection, table: "message"))?
-      .contains("thread_originator_guid") == true
-  }
-
-  static func detectAttributedBody(connection: Connection) -> Bool {
-    return (try? tableColumns(connection: connection, table: "message"))?
-      .contains("attributedbody") == true
-  }
-
-  static func detectDestinationCallerID(connection: Connection) -> Bool {
-    return (try? tableColumns(connection: connection, table: "message"))?
-      .contains("destination_caller_id") == true
-  }
-
-  static func detectAudioMessageColumn(connection: Connection) -> Bool {
-    return (try? tableColumns(connection: connection, table: "message"))?
-      .contains("is_audio_message") == true
-  }
-
-  static func detectAttachmentUserInfo(connection: Connection) -> Bool {
-    return (try? tableColumns(connection: connection, table: "attachment"))?
-      .contains("user_info") == true
-  }
-
   static func enhance(error: Error, path: String) -> Error {
     let message = String(describing: error).lowercased()
     if message.contains("out of memory (14)") || message.contains("authorization denied")
@@ -66,46 +36,22 @@ extension MessageStore {
     return error
   }
 
-  static func appleEpoch(_ date: Date) -> Int64 {
+  static func appleEpoch(_ date: Date) throws -> Binding {
     let seconds = date.timeIntervalSince1970 - MessageStore.appleEpochOffset
-    return Int64(seconds * 1_000_000_000)
+    let nanoseconds = (seconds * 1_000_000_000).rounded(.towardZero)
+    guard nanoseconds.isFinite else {
+      throw IMsgError.invalidISODate("non-finite timestamp")
+    }
+    if let integer = Int64(exactly: nanoseconds) { return integer }
+    // SQLite can compare a REAL bound beyond its INTEGER range without clipping
+    // a valid date or accidentally including a row at Int64.min/max.
+    return nanoseconds
   }
 
   func appleDate(from value: Int64?) -> Date {
     guard let value else { return Date(timeIntervalSince1970: MessageStore.appleEpochOffset) }
     return Date(
       timeIntervalSince1970: (Double(value) / 1_000_000_000) + MessageStore.appleEpochOffset)
-  }
-
-  func stringValue(_ binding: Binding?) -> String {
-    return binding as? String ?? ""
-  }
-
-  func int64Value(_ binding: Binding?) -> Int64? {
-    if let value = binding as? Int64 { return value }
-    if let value = binding as? Int { return Int64(value) }
-    if let value = binding as? Double { return Int64(value) }
-    return nil
-  }
-
-  func intValue(_ binding: Binding?) -> Int? {
-    if let value = binding as? Int { return value }
-    if let value = binding as? Int64 { return Int(value) }
-    if let value = binding as? Double { return Int(value) }
-    return nil
-  }
-
-  func boolValue(_ binding: Binding?) -> Bool {
-    if let value = binding as? Bool { return value }
-    if let value = intValue(binding) { return value != 0 }
-    return false
-  }
-
-  func dataValue(_ binding: Binding?) -> Data {
-    if let blob = binding as? Blob {
-      return Data(blob.bytes)
-    }
-    return Data()
   }
 
   func normalizeAssociatedGUID(_ guid: String) -> String {

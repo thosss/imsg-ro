@@ -1,12 +1,13 @@
 SHELL := /bin/bash
 
-.PHONY: help format lint test build imsg clean build-dylib docs-site
+.PHONY: help format lint test test-helper test-native-replies build imsg clean build-dylib docs-site
 
 help:
 	@printf "%s\n" \
 		"make format     - swift format in-place" \
 		"make lint       - swift format lint + swiftlint" \
 		"make test       - run docs-site and Swift tests" \
+		"make test-native-replies - probe native IMCore reply rendering without sending" \
 		"make build      - universal release build into bin/" \
 		"make build-dylib - build injectable dylib for Messages.app" \
 		"make imsg       - clean rebuild + run debug binary (ARGS=...)" \
@@ -17,29 +18,52 @@ format:
 	swift format --in-place --recursive Sources Tests TestsLinux
 
 lint:
-	swift format lint --recursive Sources Tests TestsLinux
-	swiftlint
+	swift format lint --strict --recursive Sources Tests TestsLinux
+	swiftlint --strict
 
 test:
 	node --test scripts/build-docs-site.test.mjs
+	$(MAKE) test-helper
 	scripts/generate-version.sh
 	swift package resolve
 	scripts/patch-deps.sh
 	swift test
 
+test-helper:
+ifeq ($(shell uname -s),Darwin)
+	@mkdir -p .build/helper-tests
+	@for source in Tests/IMsgHelperTests/*Tests.m; do \
+		binary=".build/helper-tests/$$(basename "$$source" .m)"; \
+		clang -fobjc-arc -Wno-arc-performSelector-leaks -Wno-incomplete-implementation \
+			-framework Foundation -framework AppKit -framework ImageIO -framework LinkPresentation \
+			"$$source" -o "$$binary" && "$$binary" || exit $$?; \
+	done
+	@clang -fobjc-arc -Wno-arc-performSelector-leaks -Wno-incomplete-implementation \
+		-framework Foundation -framework AppKit -framework ImageIO -framework LinkPresentation \
+		Tests/IMsgHelperTests/BridgeOwnershipHost.m -o .build/helper-tests/BridgeOwnershipHost
+else
+	@echo "Skipping native bridge tests (macOS only)."
+endif
+
+test-native-replies:
+	@mkdir -p .build/helper-tests
+	clang -fobjc-arc -Wno-arc-performSelector-leaks -Wno-incomplete-implementation \
+		-framework Foundation -framework AppKit -framework ImageIO -framework LinkPresentation \
+		Tests/IMsgHelperTests/NativeThreadedReplyProbe.m -o .build/helper-tests/NativeThreadedReplyProbe
+	.build/helper-tests/NativeThreadedReplyProbe
+
 build:
 	scripts/generate-version.sh
-	swift package resolve
-	scripts/patch-deps.sh
 	scripts/build-universal.sh
 
 # Build injectable dylib for Messages.app (DYLD_INSERT_LIBRARIES).
 # Uses arm64e architecture to match Messages.app on Apple Silicon.
 # Requires SIP disabled on the target machine to inject into system apps.
 build-dylib:
+	scripts/generate-version.sh
 	@echo "Building imsg-bridge-helper.dylib (injectable)..."
 	@mkdir -p .build/release
-	@clang -dynamiclib -arch arm64e -fobjc-arc \
+	@clang -dynamiclib -arch arm64e -mmacosx-version-min=14.0 -fobjc-arc \
 		-Wno-arc-performSelector-leaks \
 		-install_name @rpath/imsg-bridge-helper.dylib \
 		-framework Foundation \

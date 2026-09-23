@@ -7,6 +7,8 @@ This page is the command reference for `imsg` features that run through the inje
 
 Most commands take `--chat <guid>`, where a direct chat looks like `iMessage;-;+15551234567` and a group looks like `iMessage;+;chat0000`. Get the exact GUID from `imsg chats --json`, and run `imsg status --json` to inspect the selectors and RPC methods available on the current macOS version.
 
+`imsg status` probes the running helper before reporting advanced features as available. If the probe times out, text and JSON report the bridge as unresponsive and recommend `imsg launch`. A missing helper, enabled SIP, or a bridge that has not been injected retains its setup diagnostic; a reply error from an older helper is not treated as a timeout.
+
 ## Messaging
 
 Send an Apple URL preview. URL mode cannot be combined with text, effects, replies, or files.
@@ -64,7 +66,9 @@ imsg send-sticker --chat 'iMessage;-;+15551234567' \
 
 Stickers are iMessage-only. They accept PNG/APNG, GIF, or JPEG images up to 500 KiB, 618×618 pixels, 100 frames, and 25 million decoded pixels. Standalone sends require `selectors.stickerSend`; attached stickers also require `selectors.stickerAttach`.
 
-Bridge tapbacks support removal and custom emoji in addition to the standard reactions exposed by `imsg react`:
+For stickers and rich-link images, the bridge rejects pipes, symlinks, and files with extra hard links before reading them. If an image changes during the read, the command reports an error; finish writing the image before retrying.
+
+Bridge tapbacks send and remove the six standard reaction kinds. Use `--part 1` to target the second part of a multipart message, or pass `p:1/<message-guid>` as the message target:
 
 ```bash
 imsg tapback --chat 'iMessage;-;+15551234567' \
@@ -72,6 +76,8 @@ imsg tapback --chat 'iMessage;-;+15551234567' \
 imsg tapback --chat 'iMessage;-;+15551234567' \
   --message <message-guid> --kind love --remove
 ```
+
+Bridge send responses identify the newly constructed message even when dispatch is queued. A returned GUID is an acknowledgment, not proof of delivery; an unavailable GUID is returned as an empty string.
 
 ## Native polls
 
@@ -83,6 +89,34 @@ imsg poll send --chat 'iMessage;-;+15551234567' \
 ```
 
 Messages does not render the payload title on the poll balloon, so `poll send` follows it with a best-effort caption. Use `--comment` to choose different visible text or `--no-comment` when the caller already sent the context.
+
+The caption *is* the question as far as recipients are concerned, so `poll send` reports whether it landed under `comment` rather than leaving a failure on stderr:
+
+```json
+{"messageGuid":"...","comment":{"requested":true,"sent":true,"verified":true}}
+{"messageGuid":"...","comment":{"requested":true,"sent":null,"verified":false,"error":"The bridge accepted the caption, but delivery was not confirmed before the verification deadline.","disposition":"may_have_completed","retry_safe":false}}
+{"messageGuid":"...","comment":{"requested":true,"sent":false,"error":"...","disposition":"not_started","retry_safe":true}}
+{"messageGuid":"...","comment":{"requested":true,"sent":null,"error":"...","disposition":"still_in_flight","retry_safe":false}}
+{"messageGuid":"...","comment":{"requested":true,"sent":null}}
+{"messageGuid":"...","comment":{"requested":false,"sent":false}}
+```
+
+`requested` is false when the caption was suppressed. `sent` is tri-state: `true` means confirmed delivery, `false` means confirmed non-delivery, and `null` means delivery is unknown. The command still exits 0 when only the caption fails or remains unknown because the poll itself did land.
+
+A bridge acknowledgement only proves the transport accepted the send, so `poll send` also looks for the caption's row in the target chat before claiming delivery:
+
+- `sent: true, verified: true`: Messages recorded the row as delivered. The question reached the recipient.
+- `sent: false, verified: false`: Messages recorded the caption row as failed. This is confirmed non-delivery, but retry safety is not inferred from the database.
+- `sent: null, verified: false`: the row was absent, pending, or only locally sent at the verification deadline. Delivery is unknown because the caption may still arrive or fail later.
+- `sent: null` with no `verified` key: the check could not run because there was no readable database or caption GUID. Transport acknowledgement alone is not a delivery claim.
+- `sent: false, retry_safe: true`: the transport proved the caption operation did not start. Re-send only the caption text, never the poll.
+- `sent: null, retry_safe: false`: the transport reported an uncertain or still-running operation. Do not retry automatically.
+
+When the bridge returns a caption GUID, `comment.message_guid` identifies that separate message. Use RPC `message.send_status` with this GUID to check an unresolved caption later; do not use the poll GUID or assume the caption is a threaded reply.
+
+CLI output waits for the caption send attempt (the existing bridge send timeout is 150 seconds), then polls delivery for up to eight seconds. These are separate waits, not an end-to-end deadline. A slow or offline recipient can leave delivery unknown at the deadline.
+
+Only `retry_safe: true` authorizes a caption retry. Never infer retry safety from `sent`, `verified`, or human-readable `error` text.
 
 Vote or remove a vote with one option selector:
 
@@ -119,6 +153,12 @@ imsg chat-mark --chat 'iMessage;+;chat0000' --read
 ```
 
 `chat-photo` clears the photo when `--file` is omitted. `chat-mark` also accepts `--unread`. `chat-create` creates iMessage chats; SMS sending remains available through the standard `imsg send --service sms` path.
+
+Group-photo files use the same secure staging as other attachments. The source must be a regular file reached without symlink components, and the calling process needs write access to `~/Library/Messages/Attachments/imsg/`. If macOS denies staging, grant the caller Full Disk Access as described in [Permissions](permissions.md), then restart it. Clearing a photo does not stage a file.
+
+`chat-create` can create handles for previously uncontacted phone numbers and email addresses through the active iMessage account. Every recipient is IDS-checked before creating the chat; an unreachable or unresolved address fails the whole request instead of silently creating a smaller group. No Messages.app recipient-field warm-up is needed. See [chat creation](chats.md#create-an-imessage-chat) for errors and optional name/message behavior.
+
+`chat-add-member` uses the same handle creation and IDS check. An unreachable or unresolved recipient is rejected before Messages sends a group invitation.
 
 ## Account and identity
 
@@ -182,6 +222,9 @@ deadlines:
   Files are preserved.
 - A published request that vanished without a response is
   `may_have_completed`.
+
+The bridge accepts string response IDs and legacy integer IDs; fractional,
+non-finite, or out-of-range numeric IDs are rejected as malformed responses.
 
 Malformed or unreadable responses after publication are also uncertain. The
 legacy single-file command timeout is always `still_in_flight` because it has

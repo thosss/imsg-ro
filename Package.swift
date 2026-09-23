@@ -9,9 +9,10 @@ let package = Package(
     .executable(name: "imsg", targets: ["imsg"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/steipete/Commander.git", from: "0.2.4"),
+    .package(url: "https://github.com/steipete/Commander.git", from: "0.3.0"),
     .package(url: "https://github.com/stephencelis/SQLite.swift.git", from: "0.16.0"),
-    .package(url: "https://github.com/PhoneNumberKit/PhoneNumberKit.git", from: "5.0.8"),
+    .package(url: "https://github.com/stephencelis/CSQLite", from: "3.50.4"),
+    .package(url: "https://github.com/PhoneNumberKit/PhoneNumberKit.git", from: "5.0.10"),
   ],
   targets: {
     var targets: [Target] = [
@@ -19,6 +20,8 @@ let package = Package(
         name: "IMsgCore",
         dependencies: [
           .product(name: "SQLite", package: "SQLite.swift"),
+          .product(
+            name: "SQLiteSwiftCSQLite", package: "CSQLite", condition: .when(platforms: [.linux])),
           .product(name: "PhoneNumberKit", package: "PhoneNumberKit"),
         ],
         linkerSettings: [
@@ -58,7 +61,8 @@ let package = Package(
           name: "IMsgCoreTests",
           dependencies: [
             "IMsgCore"
-          ]
+          ],
+          resources: [.copy("Fixtures")]
         ),
         .testTarget(
           name: "imsgTests",

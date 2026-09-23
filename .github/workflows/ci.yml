@@ -8,13 +8,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos:
     runs-on: macos-26
+    timeout-minutes: 30
     env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       SWIFTLINT_VERSION: 0.65.1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26.10.0"
       - name: macOS version
         run: sw_vers
       - name: Swift version
@@ -29,27 +38,18 @@ jobs:
         run: make lint
       - name: Test
         run: make test
+      - name: Native reply construction (no send)
+        run: make test-native-replies
       - name: Build
         run: make build ARCHES="$(uname -m)"
 
   linux-read-core:
-    runs-on: ubuntu-latest
-    container: swift:6.3.3-noble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - name: Swift version
-        run: swift --version
-      - name: Install Python
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends python3
-      - name: Generate version
-        run: scripts/generate-version.sh
-      - name: Resolve dependencies
-        run: swift package resolve
-      - name: Patch dependencies
-        run: scripts/patch-deps.sh
-      - name: Test Linux read core
-        run: swift test
-      - name: Build CLI
-        run: swift build --product imsg
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26.10.0"
+      - name: Test Linux read core and standalone release archive
+        run: scripts/check-linux.sh

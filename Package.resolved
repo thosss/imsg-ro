@@ -1,13 +1,22 @@
 {
-  "originHash" : "507c9e98ff3b67d55824b5ebb4dd7392b8c8006a20e5ff692513cd293438b6a4",
+  "originHash" : "4521efb70cf376750c0c5f85d47e330bc42add9e19feff7585191c57df76b4e1",
   "pins" : [
     {
       "identity" : "commander",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/steipete/Commander.git",
       "state" : {
-        "revision" : "bd219c4ee9032fee3e009856f81fcc6ec09a85f4",
-        "version" : "0.2.4"
+        "revision" : "3f5a3cb1f19ce7ca79fdc2111a09dfb3da200c1c",
+        "version" : "0.3.0"
+      }
+    },
+    {
+      "identity" : "csqlite",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/stephencelis/CSQLite",
+      "state" : {
+        "revision" : "8ad83035460a3d1029a2c5a0cca4f980297a9ca2",
+        "version" : "3.53.3"
       }
     },
     {
@@ -15,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/PhoneNumberKit/PhoneNumberKit.git",
       "state" : {
-        "revision" : "cf2f1df6f2fe8b49701f4b43f0e97c7bd113d034",
-        "version" : "5.0.8"
+        "revision" : "38783049b71a4f774843341baa7ef5f4ceecfcaf",
+        "version" : "5.0.10"
       }
     },
     {

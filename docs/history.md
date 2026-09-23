@@ -3,7 +3,7 @@ title: History
 description: "Read message history from one chat with optional date, participant, and attachment filters."
 ---
 
-`imsg history` reads messages from a single chat in chronological order. It's the bread-and-butter command for one-shot reads — search, archive, summarize, transcribe.
+`imsg history` reads messages from a single chat, newest first. Messages with equal timestamps are ordered by descending row ID before applying the limit.
 
 ## Basic read
 
@@ -23,7 +23,9 @@ imsg history --chat-id 42 \
   --json
 ```
 
-Both bounds accept ISO 8601 with explicit timezone. Either bound is optional:
+Both bounds accept ISO 8601 with explicit timezone. Either bound is optional.
+
+Dates outside the range of Messages' integer timestamps remain valid query bounds. For example, an end date in year 9999 includes all stored dates, while a start date in that year returns no messages.
 
 ```bash
 # Everything since May 1st.
@@ -45,7 +47,7 @@ Match is on the message's `sender` (raw handle), not the resolved contact name. 
 
 ## Attachments
 
-`--attachments` adds an `attachments` array to each message containing filename, UTI, MIME type, byte count, and resolved on-disk path:
+JSON history always includes attachment metadata: filename, UTI, MIME type, byte count, and resolved on-disk path. `--attachments` also displays attachments in human-readable output:
 
 ```bash
 imsg history --chat-id 42 --attachments --json
@@ -57,11 +59,13 @@ imsg history --chat-id 42 --attachments --json
 
 Some Messages rows store rich text in a binary `attributedBody` column with the plain `text` column empty. `imsg history` decodes the typed-stream payload (including UTF-16LE BOM bodies) and surfaces the recovered text in the standard `text` field. No flag needed; this is on by default.
 
-If a message is still empty, the source row genuinely had no text — usually a sticker, link preview, or attachment-only message.
+Typed-stream decoding preserves Unicode and leading line breaks, including long messages. Truncated or malformed typed-stream bodies produce empty text instead of binary archive bytes. Sticker, link-preview, and attachment-only rows may also have no text.
 
 ## Reactions in history
 
 Tapback rows (`Liked "..."`, `Loved "..."`, etc.) are hidden from `history` output by design. They'd otherwise duplicate every reacted message. To see tapbacks, use [`imsg watch --reactions`](watch.md#reactions); the live stream surfaces add and remove events with `is_reaction`, `reaction_type`, and `reacted_to_guid`.
+
+Current reaction snapshots use the same add/remove rules in history and watch. Changes are applied in database timestamp order, then row ID order when timestamps tie.
 
 ## Native polls
 
@@ -95,6 +99,8 @@ poll's stable option identifier before sending:
 imsg poll vote --chat-id <id> --poll <poll-guid> --option-index 2
 ```
 
+Option updates remain part of the original poll. Selective unvote reads the newest outbound vote across the original and its update messages, preserving other selected options. An empty newest snapshot means all selections were removed.
+
 On macOS 26.4, use imsg 0.12.2 or later. Earlier builds could create a local
 vote row without the Polls payload, so the recipient's poll did not update.
 
@@ -122,8 +128,8 @@ imsg history --chat-id 42 --limit 5000 --json \
 
 ## Message object
 
-See [JSON output](json.md#message) for the canonical schema. Every history result has at minimum:
+See [JSON output](json.md#message) for the canonical schema. Core fields include:
 
-`id`, `chat_id`, `chat_identifier`, `chat_guid`, `chat_name`, `participants`, `is_group`, `guid`, `reply_to_guid`, `destination_caller_id`, `sender`, `sender_name`, `is_from_me`, `text`, `created_at`.
+`id`, `chat_id`, `chat_identifier`, `chat_guid`, `chat_name`, `participants`, `is_group`, `guid`, `sender`, `is_from_me`, `text`, `created_at`, and `attachments`.
 
-When `--attachments` is set, also: `attachments[]`. Native polls include `poll`. Reactions only appear in `watch --reactions` output.
+Optional fields such as `reply_to_guid`, `destination_caller_id`, and `sender_name` appear when available. Native polls include `poll`. Standalone reaction events appear in `watch --reactions`; history may include a `reactions` snapshot on the message they target.

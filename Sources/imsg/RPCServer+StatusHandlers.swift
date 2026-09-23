@@ -157,7 +157,7 @@ extension RPCServer {
       "protocol_version": kRPCProtocolVersion,
       "database": databaseSnapshot.dictionary,
       "bridge": bridgeSnapshot.dictionary,
-      "contacts": ["available": !contactResolver.contactsUnavailable],
+      "contacts": ["available": !contactResolver.cached.contactsUnavailable],
       "methods": methods,
       "supported_methods": supported,
       "read_only": readOnly,

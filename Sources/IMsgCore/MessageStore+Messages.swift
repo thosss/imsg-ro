@@ -4,8 +4,7 @@ import SQLite
 extension MessageStore {
   public func maxRowID() throws -> Int64 {
     return try withConnection { db in
-      let value = try db.scalar("SELECT MAX(ROWID) FROM message")
-      return int64Value(value) ?? 0
+      try db.scalar("SELECT MAX(ROWID) FROM message") as? Int64 ?? 0
     }
   }
 
@@ -19,7 +18,7 @@ extension MessageStore {
 
     return try withConnection { db in
       while true {
-        let query = ChatMessagesQuery(
+        let query = try ChatMessagesQuery(
           store: self,
           chatID: ChatID(rawValue: chatID),
           limit: physicalLimit,
@@ -61,13 +60,13 @@ extension MessageStore {
           fallbackReplacementUsed: {
             usedFallbackReplacement = true
           }
-        ).sorted(by: messageHistoryNewestFirst)
+        ).sorted(by: messageNewestFirst)
 
         if messages.count < physicalLimit || (coalesced.count >= limit && !usedFallbackReplacement)
         {
           return Array(coalesced.prefix(limit))
         }
-        guard let nextLimit = nextHistoryPhysicalLimit(after: physicalLimit) else {
+        guard let nextLimit = nextMessageQueryLimit(after: physicalLimit) else {
           return Array(coalesced.prefix(limit))
         }
         physicalLimit = nextLimit
@@ -75,12 +74,12 @@ extension MessageStore {
     }
   }
 
-  private func nextHistoryPhysicalLimit(after current: Int) -> Int? {
+  func nextMessageQueryLimit(after current: Int) -> Int? {
     guard current > 0, current <= Int.max / 2 else { return nil }
     return current * 2
   }
 
-  private func messageHistoryNewestFirst(_ lhs: Message, _ rhs: Message) -> Bool {
+  func messageNewestFirst(_ lhs: Message, _ rhs: Message) -> Bool {
     if lhs.date == rhs.date {
       return lhs.rowID > rhs.rowID
     }
@@ -110,11 +109,13 @@ extension MessageStore {
         afterRowID: cursor,
         chatID: chatID,
         limit: limit,
-        includeReactions: includeReactions,
-        dedupeState: &dedupeState
+        includeReactions: includeReactions
       )
-      if !batch.messages.isEmpty {
-        return batch.messages
+      let visibleMessages = batch.messages.filter { message in
+        !isURLPreviewBalloon(message) || !dedupeState.shouldSkip(message)
+      }
+      if !visibleMessages.isEmpty {
+        return visibleMessages
       }
       guard batch.maxScannedRowID > cursor else {
         return []
@@ -186,7 +187,7 @@ extension MessageStore {
             hasMore: false
           )
         }
-        guard let nextLimit = nextHistoryPhysicalLimit(after: physicalLimit) else {
+        guard let nextLimit = nextMessageQueryLimit(after: physicalLimit) else {
           return MessagesAfterPage(
             messages: visibleMessages,
             nextRowID: physicalMessages.last?.rowID ?? afterRowID,
@@ -202,8 +203,7 @@ extension MessageStore {
     afterRowID: Int64,
     chatID: Int64?,
     limit: Int,
-    includeReactions: Bool,
-    dedupeState: inout URLBalloonDedupeState
+    includeReactions: Bool
   ) throws -> MessagesAfterBatch {
     guard limit > 0 else {
       return MessagesAfterBatch(messages: [], maxScannedRowID: afterRowID)
@@ -250,11 +250,7 @@ extension MessageStore {
           return .suppress
         }
       )
-      let visibleMessages = coalesced.filter { message in
-        guard isURLPreviewBalloon(message) else { return true }
-        return !dedupeState.shouldSkip(message)
-      }
-      return MessagesAfterBatch(messages: visibleMessages, maxScannedRowID: maxScannedRowID)
+      return MessagesAfterBatch(messages: coalesced, maxScannedRowID: maxScannedRowID)
     }
   }
 
@@ -263,7 +259,7 @@ extension MessageStore {
   {
     guard !text.isEmpty else { return nil }
 
-    let query = LatestSentMessageQuery(
+    let query = try LatestSentMessageQuery(
       store: self,
       text: text,
       chatID: chatID.map { ChatID(rawValue: $0) },

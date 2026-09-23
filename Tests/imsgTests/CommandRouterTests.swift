@@ -1,4 +1,6 @@
+import Darwin
 import Foundation
+import IMsgCore
 import Testing
 
 @testable import imsg
@@ -25,6 +27,16 @@ func commandRouterPrintsHelp() async {
 }
 
 @Test
+func commandRouterHonorsOptionTerminator() throws {
+  for flag in ["--version", "-V", "--help", "-h"] {
+    let result = try runIMsgProcess(["completions", "--", flag])
+    #expect(result.status == 1)
+    #expect(result.output.isEmpty)
+    #expect(result.error.contains("Unknown shell"))
+  }
+}
+
+@Test
 func commandRouterUnknownCommand() async {
   let router = CommandRouter()
   let (_, status) = await StdoutCapture.capture {
@@ -41,7 +53,23 @@ func executableWrapperPropagatesRouterStatus() throws {
 
   let invalid = try runIMsgProcess(["nope"])
   #expect(invalid.status == 1)
-  #expect(invalid.output.contains("nope") || invalid.output.contains("Unknown command"))
+  #expect(invalid.error.contains("nope") || invalid.error.contains("Unknown command"))
+}
+
+@Test
+func stickerCommandRejectsFIFOWithoutWaitingForAWriter() throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let fifo = root.appendingPathComponent("sticker.png")
+  #expect(mkfifo(fifo.path, 0o600) == 0)
+
+  let result = try runIMsgProcess([
+    "send-sticker", "--chat", "iMessage;-;+15550000000", "--file", fifo.path,
+  ])
+  #expect(result.status == 1)
+  #expect(result.error.contains("sticker must be a regular file"))
 }
 
 @Test
@@ -50,10 +78,10 @@ func commandRouterIncludesGroupCommand() {
   #expect(router.specs.contains { $0.name == "group" })
 }
 
-private func runIMsgProcess(
+func runIMsgProcess(
   _ arguments: [String],
   environment extraEnvironment: [String: String] = [:]
-) throws -> (status: Int32, output: String) {
+) throws -> (status: Int32, output: String, error: String) {
   let executable = try imsgExecutableURL()
   let process = Process()
   process.executableURL = executable
@@ -65,14 +93,43 @@ private func runIMsgProcess(
   }
   process.environment = environment
 
+  return try captureProcessOutput(process)
+}
+
+private func captureProcessOutput(_ process: Process) throws -> (
+  status: Int32, output: String, error: String
+) {
   let output = Pipe()
   process.standardOutput = output
-  process.standardError = output
+  let error = Pipe()
+  process.standardError = error
   try process.run()
   output.fileHandleForWriting.closeFile()
-  let data = output.fileHandleForReading.readDataToEndOfFile()
-  process.waitUntilExit()
-  return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+  error.fileHandleForWriting.closeFile()
+  let outputReader = TestPipeReader(handle: output.fileHandleForReading)
+  let errorReader = TestPipeReader(handle: error.fileHandleForReading)
+  outputReader.startAndWaitUntilReady()
+  errorReader.startAndWaitUntilReady()
+  #expect(!ProcessTimeout.waitUntilExit(process, timeout: 3))
+  let capturedOutput = outputReader.waitForResult()
+  let capturedError = errorReader.waitForResult()
+  #expect(capturedOutput.errorNumber == nil)
+  #expect(capturedError.errorNumber == nil)
+  return (
+    process.terminationStatus, String(decoding: capturedOutput.data, as: UTF8.self),
+    String(decoding: capturedError.data, as: UTF8.self)
+  )
+}
+
+@Test
+func processCaptureDrainsBothStreamsBeforeWaitingForExit() throws {
+  let process = Process()
+  process.executableURL = URL(fileURLWithPath: "/bin/sh")
+  process.arguments = ["-c", "printf '%131072s' ''; printf '%131072s' '' >&2"]
+  let result = try captureProcessOutput(process)
+  #expect(result.status == 0)
+  #expect(result.output == String(repeating: " ", count: 131_072))
+  #expect(result.error == String(repeating: " ", count: 131_072))
 }
 
 private func imsgExecutableURL() throws -> URL {
@@ -139,4 +196,16 @@ func completionsCommandRunsThroughRouter() async {
   }
   #expect(status == 0)
   #expect(output.contains("complete -c imsg"))
+}
+
+@Test(arguments: [
+  ["nope", "--json"],
+  ["search", "--query", "synthetic", "--match", "invalid", "--json"],
+  ["history", "--chat-id", "1", "--db", "/nonexistent/imsg-synthetic.db", "--json"],
+])
+func commandRouterKeepsDiagnosticsOffStdout(arguments: [String]) throws {
+  let result = try runIMsgProcess(arguments)
+  #expect(result.status == 1)
+  #expect(result.output.isEmpty)
+  #expect(!result.error.isEmpty)
 }

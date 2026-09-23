@@ -23,7 +23,7 @@ imsg send --to "Jane Appleseed" --text "hi"
 For unambiguous routing, prefer phone numbers in E.164 form.
 
 When `chat.db` is readable and the recipient already has a direct chat, `imsg`
-targets that chat's GUID instead of constructing a new buddy send. New
+targets a compatible chat's GUID instead of constructing a new buddy send. Explicit `sms` and `imessage` selection never reuse a chat on the opposite service. New
 recipients still use the existing buddy-send behavior.
 
 If that GUID is absent from Messages.app's live chats, `imsg` recovers from
@@ -65,7 +65,7 @@ Both `--text` and `--file` can be supplied together.
 
 Before handing the file to Messages, `imsg` stages it under `~/Library/Messages/Attachments/imsg/`. Messages reads attachments from there reliably across macOS versions; sending directly from `~/Desktop` or `~/Downloads` can hit sandbox-related send failures.
 
-Audio files (`.m4a`, `.caf`, `.aiff`, etc.) send the same way as any other file. Messages exposes them as audio messages on the receiving side.
+Audio files (`.m4a`, `.caf`, `.aiff`, etc.) send as ordinary attachments. For a native inline voice message, use bridge-backed [`send-attachment --audio`](attachments.md#native-voice-messages).
 
 ## Service selection
 
@@ -93,7 +93,7 @@ state, not wording inferred from an error message.
 imsg send --to "415-555-1212" --text "hi" --region US
 ```
 
-Defaults to `US`. Pass an ISO 3166-1 alpha-2 country code to normalize locally-formatted numbers. `--service auto` uses the same normalized phone number when checking local Messages history, so SMS-only history is detected for local-format numbers outside the US too.
+Defaults to `US`. Pass an ISO 3166-1 alpha-2 country code to normalize locally-formatted numbers. Chat selection, service detection, dispatch, and verification use the same normalized recipient, including local-format numbers outside the US.
 
 ## Confirming what was sent
 
@@ -102,8 +102,7 @@ Default text mode prints `sent` on success. JSON mode emits `{"status":"sent"}`.
 When `chat.db` is readable, every AppleScript text send waits up to eight
 seconds for the matching outgoing row. If Messages reports success but no row
 appears, `imsg` returns `may_have_completed` with no-retry guidance instead of
-reporting success. The lookup uses the known chat rowid when available and a
-bounded global text lookup for a new recipient. Direct sends still retain the
+reporting success. The lookup is scoped to the actual send route; after a safe SMS fallback, it verifies the SMS chat and reports that message's ID and service. A new recipient's chat must become visible before its text can be confirmed. Direct sends still retain the
 previous accepted behavior when the database is unavailable. Attachment-only
 verification is unchanged.
 
@@ -131,7 +130,11 @@ imsg react --chat-id 42 --reaction emphasis
 imsg react --chat-id 42 --reaction question
 ```
 
-`react` sends only the six standard tapbacks Messages.app exposes reliably through automation. After the AppleScript call, `imsg` confirms the reaction selection in Messages' UI before reporting success — this guards against silent UI rejections.
+`react` attempts the six standard tapbacks through Messages UI automation. The chat must exist in Messages' live AppleScript `chats` collection; a chat stored only in `chat.db` cannot be selected this way. Messages applies its shortcut to the last or selected message, so this command cannot guarantee a specific message target. Use bridge `tapback` when you need GUID targeting.
+
+After the AppleScript call, `imsg` waits up to five seconds for a new outgoing reaction of the requested type in the requested chat's database history. A no-op, unrelated incoming reaction, or existing reaction no longer produces a success response. Confirmation establishes a local outgoing record, not remote delivery or exact message targeting. A timeout reports uncertain delivery: inspect Messages before retrying because repeating a tapback can remove it.
+
+On macOS 27, the documented Command-T shortcut can still silently do nothing in some UI states (#311). Database confirmation detects that failure; it does not repair the underlying UI incompatibility.
 
 Custom emoji tapbacks can be *read* in `watch --reactions` output, but `react` rejects them rather than taking a no-op AppleScript path. There is no published automation surface that sends arbitrary emoji tapbacks reliably.
 

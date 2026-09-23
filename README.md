@@ -64,11 +64,15 @@ Read commands open the database in SQLite read-only mode. `watch` follows databa
 
 Full Disk Access is required for local database reads. Sending and standard tapbacks also require **Automation → Messages**; Contacts access is optional and only adds resolved names. The [permissions guide](docs/permissions.md) covers parent-process grants and stale TCC entries, while [troubleshooting](docs/troubleshooting.md) maps common failures to their likely gate.
 
+SSH sessions can also resolve contact names through the Mac’s read-only AddressBook database when the SSH service has Full Disk Access and Contacts.framework is unavailable. See [Contacts over SSH](docs/permissions.md#contacts-over-ssh).
+
 For SMS, enable Text Message Forwarding on the paired iPhone. `imsg send` uses Messages.app's AppleScript surface and cannot force a particular outgoing number when several numbers share one Apple ID.
 
 ## JSON and automation
 
 `--json` emits one JSON object per line. Human progress and warnings stay on stderr, so stdout remains safe to stream. Pipe finite commands through `jq -s` when you want one array.
+
+Numeric selectors are validated before work starts: chat IDs, limits, and poll option indices must be positive integers; message-part indices can also be zero. Malformed or overflowing values produce an error instead of selecting a default target. Defaults apply only when an option is omitted.
 
 ```bash
 imsg chats --json | jq -s
@@ -178,6 +182,8 @@ Normal `chats`, `history`, `watch`, `send`, `react`, and read-only RPC workflows
 
 Read receipts, typing indicators, rich sends, message mutation, stickers, polls, and chat management use an injected helper inside Messages.app. They require SIP to be disabled and may be blocked by library validation or private-entitlement checks on current macOS releases. Start with [Advanced IMCore](docs/advanced-imcore.md), then use the [bridge command reference](docs/bridge.md) for the full CLI surface and IPC layout.
 
+[`imsg chat-create`](docs/chats.md#create-an-imessage-chat) accepts phone numbers and email addresses you have never contacted. It creates missing handles through the active iMessage account and checks every recipient with IDS before creating the chat. You do not need to type recipients into Messages first.
+
 ## Documentation
 
 The complete guide lives at **[imsg.sh](https://imsg.sh)**. Useful entry points include [install](docs/install.md), [permissions](docs/permissions.md), [history](docs/history.md), [watch](docs/watch.md), [send](docs/send.md), [attachments](docs/attachments.md), [Linux](docs/linux.md), and [troubleshooting](docs/troubleshooting.md).
@@ -191,6 +197,8 @@ make build
 ```
 
 `IMsgCore` contains the reusable Swift core, `imsg` contains the CLI, and `IMsgHelper` contains the optional injected helper. The package uses Swift 6 and targets macOS 14 or newer.
+
+CI pins Xcode 26.6 on macOS, Swift 6.4.0 on Linux, Node 26.10.0 for docs tests, and SwiftLint 0.65.1. `make lint` treats formatting and lint findings as errors. `scripts/check-linux.sh` runs Linux tests and builds in the pinned Swift container, checks the standalone release archive in Ubuntu without Swift, and runs docs tests with the host's Node installation. Crabbox hydration installs the pinned Node version.
 
 ## License
 

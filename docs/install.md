@@ -26,13 +26,15 @@ brew untap steipete/tap   # optional
 ## Build from source
 
 ```bash
-git clone https://github.com/steipete/imsg.git
+git clone https://github.com/openclaw/imsg.git
 cd imsg
 make build
 ./bin/imsg --help
 ```
 
-`make build` runs the universal release build through Swift Package Manager and patches `SQLite.swift` with the repo's required adjustments. The binary lands at `bin/imsg`.
+`make build` runs the universal release build through Swift Package Manager and applies the required SQLite.swift and PhoneNumberKit resource patches. The binary lands at `bin/imsg`.
+
+Each architecture's dependency checkout is patched before compilation. Keep the generated resource bundles beside the executable when installing it elsewhere; invoking that executable through a symlink is supported. The CLI and helper both target macOS 14 or newer.
 
 For day-to-day development:
 

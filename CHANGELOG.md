@@ -4,6 +4,11 @@
 
 ### Safety (fork)
 
+- Merge upstream 0.15.8 and carry `--read-only` and `--redact-codes` onto it.
+  Picks up upstream's message-query cardinality fix (#263), whose absence
+  crashed `messages.after` with "Duplicate values for key" on some page
+  boundaries, and native-length attributed-text decoding (#264). The
+  read-only gate moved with `handleLine` into `RPCServer+Dispatch.swift`.
 - Merge upstream 0.14.2 and carry the fork's `--read-only` and `--redact-codes`
   flags onto the rewritten RPC layer.
 - `--read-only`: the permitted-method allow-list is now derived from each
@@ -54,14 +59,115 @@
   the split matters on the Linux read-core build, where compiled-out *read*
   methods were being reported as blocked mutations.
 
+## 0.15.8 - 2026-09-22
+
+**Highlights:** Fixed phone-input normalization denial of service, truthful Tapback results, and standalone Linux archives.
+
+0.15.7 was not published because its Linux archive failed to link; its frozen tag is retained.
+
+- **Security:** Update PhoneNumberKit to 5.0.10 to fix quadratic phone-input normalization and enforce its input-length limit (GHSA-3q4f-3hg9-9565).
+- Stop `react` reporting success for no-op UI automation by confirming a new outgoing tapback in the requested chat; document live-chat and message-targeting limitations (#311, thanks @cryptosmithio).
+- Build complete static Linux archives with SwiftPM’s native backend, locate build products through SwiftPM, and verify packaged resources in Ubuntu without Swift installed.
+
+## 0.15.6 - 2026-09-17
+
+**Highlights:** Visible native reply bubbles, responsive message watches, and reliable injected-helper upgrades.
+
+- Keep outgoing native threaded replies visible in Messages, preserve threading through older message constructors, and verify native text/multipart construction in CI (#306, thanks @gennadyclaw).
+- Keep CLI/RPC watch delivery and RPC status responsive during stalled Contacts reads by refreshing optional contact names in the background (#307, thanks @KlingMedia).
+- Preserve the synchronous and asynchronous no-argument `MessagesLauncher.ensureRunning` function signatures for existing library clients.
+- Reject malformed numeric bridge response IDs instead of crashing or truncating them, preserving uncertain delivery errors for sends.
+- **Compatibility:** Replace stale injected helpers under the launch lock after an upgrade, report helper versions and mismatches in `status`, and generate matching helper/CLI versions for standalone builds. `imsg launch --force` relaunches unconditionally (#301, thanks @dkattan).
+
+## 0.15.5 - 2026-09-14
+
+**Highlights:** Release executables no longer crash on phone metadata lookups through symlinks, distant date filters no longer crash, and group-photo staging is secure (thanks @SebTardif).
+
+- Fix release executables crashing on phone metadata lookup through symlinks by applying resource patches to each architecture's actual dependency checkout.
+- Fix CLI and RPC date filters crashing on valid distant dates such as year 9999; compare out-of-range bounds correctly instead of overflowing the database timestamp representation.
+- **Compatibility:** Securely stage group-photo files for CLI `chat-photo` and RPC `group.setIcon`, rejecting symlink paths before transfer; callers need write access to Messages' attachment staging directory, as with other attachments (#288, thanks @SebTardif).
+- Build the injected helper for the declared macOS 14 minimum instead of inheriting the build host's deployment target.
+
+## 0.15.4 - 2026-09-11
+
+**Highlights:** Native voice messages that play inline in Messages.
+
+- Prepare native voice attachments as CAF/Opus for CLI `--audio` and RPC `send.attachment`, fixing unplayable `00:00` bubbles while preserving original files and ordinary attachment sends (#278, thanks @coletebou).
+- Update PhoneNumberKit to 5.0.9 with phone-number metadata 9.0.39.
+
+## 0.15.3 - 2026-09-07
+
+**Highlights:** Reliable bridge ownership when multiple injected Messages instances overlap.
+
+- Keep one bridge helper active per Messages container, preserve readiness when a standby exits, and automatically take over after the owner stops (#284, thanks @omarshahine).
+
+## 0.15.2 - 2026-09-07
+
+**Highlights:** Safer bridge startup for concurrent callers and slow-starting Macs, with reliable local test runs.
+
+- Serialize Messages bridge launches across processes so waiting callers reuse the ready instance without overlapping startup or shared queue cleanup (#274, thanks @goutamadwant).
+- Let slow hosts extend bridge readiness with `IMSG_LAUNCH_READY_TIMEOUT`, recheck readiness at the deadline, and explain startup timeouts while preserving the 15-second default and public error contract (#276, thanks @omarshahine).
+- Keep RPC send-result tests independent of an injected bridge by explicitly selecting their fixture transport (#277, thanks @omarshahine).
+- Drain CLI test subprocess output while commands run, preventing deadlocks from large output or constrained pipe buffers (#279).
+
+## 0.15.1 - 2026-09-04
+
+### Highlights
+
+- Send results identify the new message and the actual delivery route, including SMS fallback. Tapbacks target the requested message part.
+- Watch streams catch up promptly without losing URL previews during retries, and RPC shutdown waits for subscription cleanup.
+- Search finds Unicode case variants and audio transcripts, while history preserves long messages, Unicode characters, and leading line breaks.
+
 ### Fixes
 
-- Fall back to raw chat identifiers for empty display names and distinguish unavailable Contacts from unmatched local nicknames (#250, thanks @riverr4t).
+- Normalize recipients before selecting a conversation, honor explicit iMessage/SMS choices, and verify the successful delivery route after SMS fallback. RPC results no longer identify an unrelated same-text message in the abandoned chat (#269).
+- Return the newly constructed message's GUID from native send acknowledgments, including deferred sends, instead of the previous message's GUID (#267).
+- Apply tapbacks to the requested message part consistently and reject missing nonzero parts before dispatch (#267).
+- Preserve URL previews when watch retries an unresolved row, and drain queued replay batches without waiting for another filesystem event or polling interval (#260).
+- Match Unicode text case-insensitively across plain and attributed bodies, and search audio transcripts even when the first attachment has no transcript. Keep exact and contains searches consistent on macOS and Linux (#265).
+- Decode attributed bodies using native archive lengths, preserving long text, Unicode, and leading newlines without leaking archive bytes from malformed or truncated bodies (#264).
+- Prevent duplicate messages, stalled pagination, and preview-enrichment crashes when one message belongs to multiple chats. Apply stable history ordering before limits and preserve associated events that are not reactions (#263).
+- Resolve the latest local poll selections across original polls and option-update messages, so selective unvote preserves the remaining choices and honors an empty latest selection (#268).
+- Keep reaction state consistent between history and watch when timestamps tie or differ by nanoseconds, and match message GUID casing consistently (#268).
+- Wait for active database watches and bridge event subscriptions to finish cancellation when unsubscribe and RPC shutdown overlap (#266).
+- Reject unsafe sticker paths and non-regular media inputs without hanging the CLI or Messages bridge. Share bounded snapshot reads for stickers and rich-link images while retaining their directory-access checks (#258, #262).
+- Reject malformed numeric selectors and invalid or overflowing durations before side effects; accept compound durations such as `2s500ms` and respect `--` before help/version-like arguments (#259).
+- Send generic CLI errors and error-triggered help to stderr so stdout remains usable by scripts (#269).
+
+### Performance and Maintenance
+
+- Reuse phone-number metadata for repeated single and batch contact lookups, preserving regional matching, permission checks, refreshes, and SSH lookup behavior (#261).
+- Consolidate routing, cancellation, decoding, and poll/reaction helpers; remove duplicate media readers and obsolete bridge diagnostics. Expand regression coverage with native archive fixtures, synthetic bridge handlers, and CLI/RPC behavior checks (#262, #263, #264, #266, #267, #268, #269).
+
+## 0.15.0 - 2026-09-03
+
+### Highlights
+
+- Contact names now resolve over SSH with Full Disk Access, including local lookups, chat lists, and JSON-RPC, without a Contacts permission prompt.
+- Create iMessage groups with previously uncontacted recipients without first entering them in Messages.app. Unreachable recipients produce a clear error instead of a partial group.
+- Get clearer outcomes from automation: poll sends report whether the separate question caption arrived, and `imsg status` detects an unresponsive bridge.
+
+### Fixes
+
+- Resolve contact names over SSH from existing read-only AddressBook stores when Contacts.framework has no grant, while preferring native Contacts when authorized. Refresh synced changes and clear stale names when the source or access changes (#250, #255, thanks @riverr4t).
+- Let `chat-create`, RPC `chat.create`, and `chat-add-member` create handles for previously uncontacted phone numbers and email addresses. Check iMessage availability before creating a chat or inviting a member, and reject unreachable or unresolved recipients without dropping them from the request (#254).
+- Report poll-caption delivery separately in CLI and RPC results, including unknown outcomes, retry safety, and the caption GUID for later status checks. Keep successful poll creation distinct from caption failures so callers can avoid duplicate polls (#239, thanks @omarshahine).
+- Report advanced features as unavailable when the live bridge status probe times out, with an `imsg launch` recovery hint; preserve existing setup diagnostics and avoid treating older-helper reply errors as timeouts (#253, thanks @omarshahine).
 - Let headless `nickname --local` return without an unanswered Contacts permission prompt while preserving interactive prompting (#248, thanks @SebTardif).
+- Fall back to raw chat identifiers for empty chat-list names while preserving stored titles in JSON/RPC metadata, and distinguish unavailable Contacts from an unmatched local nickname in text output (#250, #252, thanks @riverr4t).
+
+### Documentation
+
+- Fix table-of-contents labels and links for formatted, nested, and repeated headings, with unique anchors and correctly escaped heading text (#243, thanks @vincentkoc).
 
 ### Dependencies
 
-- Update PhoneNumberKit to 5.0.8 for current phone-number metadata.
+- Update PhoneNumberKit to 5.0.8 for current phone-number metadata (#251).
+- Update the GitHub Pages deployment action to 5.0.1 for deployment-status polling backoff and jitter (#256).
+
+### Maintenance
+
+- Remove a timing race in the RPC watch freshness test that could lose its first message and stall CI (#255).
 
 ## 0.14.2 - 2026-08-28
 

@@ -57,10 +57,12 @@ final class RPCServer: @unchecked Sendable {
   /// When true, texted security/verification codes (2FA, OTP) are redacted
   /// from message text in results and notifications.
   let redactCodes: Bool
-  let sendMessage: (MessageSendOptions) throws -> Void
+  let sendMessage: (MessageSendOptions) throws -> MessageSendOptions
   let resolveSentMessage: SentMessageResolver
   let bridgeInvoker: BridgeInvoker
+  let captionVerifier: CaptionVerifier
   let stageAttachment: AttachmentStager
+  let stageAudioAttachment: AttachmentStager
   let stageSticker: StickerStager
   let prepareRichLink: RichLinkPrepare
   let isBridgeReady: () -> Bool
@@ -73,18 +75,32 @@ final class RPCServer: @unchecked Sendable {
   let bridgeEventPathUsable: @Sendable (String) -> Bool
   let bridgeEventStreamProvider: RPCBridgeEventStreamProvider
 
+  /// Reports the caption row's outcome in the target chat, including explicit
+  /// unknown and unavailable states that must not become delivery verdicts.
+  typealias CaptionVerifier = (
+    _ captionGUID: String, _ chatGUID: String, _ store: MessageStore?
+  ) async -> PollCaptionStatus.VerificationOutcome
+
   init(
     store: MessageStore,
     verbose: Bool,
     readOnly: Bool = false,
     redactCodes: Bool = false,
     output: RPCOutput = RPCWriter(),
-    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+    sendMessage: @escaping (MessageSendOptions) throws -> MessageSendOptions = {
+      try MessageSender().sendResolvingRoute($0)
+    },
     resolveSentMessage: @escaping SentMessageResolver = RPCServer.resolveSentMessage,
     invokeBridge: @escaping BridgeInvoker = { action, params in
       try await IMsgBridgeClient.shared.invokeWithoutLaunching(action: action, params: params)
     },
+    verifyCaption: @escaping CaptionVerifier = { captionGUID, chatGUID, store in
+      await PollCaptionStatus.verifyCaption(
+        captionGUID: captionGUID, chatGUID: chatGUID, store: store,
+        timeout: PollCaptionStatus.rpcVerifyTimeout)
+    },
     stageAttachment: @escaping AttachmentStager = MessageSender.stageAttachmentForMessagesApp,
+    stageAudioAttachment: @escaping AttachmentStager = AudioMessagePreparer.prepare,
     stageSticker: @escaping StickerStager = {
       try StickerAssetPreparer.prepare(at: $0)
     },
@@ -130,7 +146,9 @@ final class RPCServer: @unchecked Sendable {
     self.sendMessage = sendMessage
     self.resolveSentMessage = resolveSentMessage
     self.bridgeInvoker = invokeBridge
+    self.captionVerifier = verifyCaption
     self.stageAttachment = stageAttachment
+    self.stageAudioAttachment = stageAudioAttachment
     self.stageSticker = stageSticker
     self.prepareRichLink = prepareRichLink
     self.isBridgeReady = isBridgeReady
@@ -151,12 +169,20 @@ final class RPCServer: @unchecked Sendable {
     redactCodes: Bool = false,
     output: RPCOutput = RPCWriter(),
     storeFactory: @escaping RPCMessageStoreFactory = { try MessageStore(path: $0) },
-    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+    sendMessage: @escaping (MessageSendOptions) throws -> MessageSendOptions = {
+      try MessageSender().sendResolvingRoute($0)
+    },
     resolveSentMessage: @escaping SentMessageResolver = RPCServer.resolveSentMessage,
     invokeBridge: @escaping BridgeInvoker = { action, params in
       try await IMsgBridgeClient.shared.invokeWithoutLaunching(action: action, params: params)
     },
+    verifyCaption: @escaping CaptionVerifier = { captionGUID, chatGUID, store in
+      await PollCaptionStatus.verifyCaption(
+        captionGUID: captionGUID, chatGUID: chatGUID, store: store,
+        timeout: PollCaptionStatus.rpcVerifyTimeout)
+    },
     stageAttachment: @escaping AttachmentStager = MessageSender.stageAttachmentForMessagesApp,
+    stageAudioAttachment: @escaping AttachmentStager = AudioMessagePreparer.prepare,
     stageSticker: @escaping StickerStager = { try StickerAssetPreparer.prepare(at: $0) },
     prepareRichLink: @escaping RichLinkPrepare = { try await RichLinkPreparer.prepare($0) },
     isBridgeReady: @escaping () -> Bool = { IMsgBridgeClient.shared.isReady() },
@@ -203,7 +229,9 @@ final class RPCServer: @unchecked Sendable {
     self.sendMessage = sendMessage
     self.resolveSentMessage = resolveSentMessage
     self.bridgeInvoker = invokeBridge
+    self.captionVerifier = verifyCaption
     self.stageAttachment = stageAttachment
+    self.stageAudioAttachment = stageAudioAttachment
     self.stageSticker = stageSticker
     self.prepareRichLink = prepareRichLink
     self.isBridgeReady = isBridgeReady
@@ -217,54 +245,6 @@ final class RPCServer: @unchecked Sendable {
     self.watchStreamProvider = watchStreamProvider
   }
 
-  func run() async throws {
-    try await run(lines: RPCLineSource.standardInput())
-  }
-
-  func run(lines: RPCLineStream) async throws {
-    let scheduler = RPCScheduler(server: self)
-    try await withTaskCancellationHandler {
-      try await run(lines: lines, scheduler: scheduler)
-    } onCancel: {
-      Task.detached { [subscriptions] in
-        await scheduler.stopAdmissionAndCancelReadControl()
-        await subscriptions.cancelAll()
-      }
-    }
-  }
-
-  private func run(lines: RPCLineStream, scheduler: RPCScheduler) async throws {
-    var sourceError: Error?
-    do {
-      for try await line in lines {
-        try Task.checkCancellation()
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { continue }
-        await scheduler.submit(trimmed)
-      }
-    } catch {
-      sourceError = error
-    }
-
-    let cancelled = Task.isCancelled || sourceError is CancellationError
-    if cancelled || sourceError != nil {
-      await scheduler.stopAdmissionAndCancelReadControl()
-    } else {
-      await scheduler.stopAdmission()
-    }
-    // EOF and cancellation stop live producers before accepted request drain.
-    await subscriptions.cancelAll()
-    await scheduler.waitUntilDrained()
-    output.flush()
-
-    if let sourceError {
-      throw sourceError
-    }
-    if cancelled || Task.isCancelled {
-      throw CancellationError()
-    }
-  }
-
   func handleLineForTesting(_ line: String) async {
     _ = await handleLine(line)
   }
@@ -272,185 +252,6 @@ final class RPCServer: @unchecked Sendable {
   func respond(id: Any?, result: Any) {
     guard let id else { return }
     output.sendResponse(id: id, result: result)
-  }
-
-  func handleLine(_ line: String) async -> RPCExecutionResult {
-    let request: RPCRequest
-    switch RPCRequestParser.parse(line) {
-    case .success(let parsed):
-      request = parsed
-    case .failure(let failure):
-      if failure.shouldRespond {
-        output.sendError(id: failure.id, error: failure.error)
-      }
-      return .completed
-    }
-    let method = request.method
-    let params = request.params
-    let id = request.id
-
-    // Allow-list, not block-list: a method passes only if its descriptor
-    // declares a non-mutating lane for this platform (see
-    // `kReadOnlyRPCMethods`). Any unregistered method name is denied by
-    // omission, so the gate stays fail-closed regardless of what the dispatch
-    // switch below happens to cover.
-    //
-    // The refusal is evaluated before dispatch, so nothing runs. Notifications
-    // get no response, per JSON-RPC — they are still refused, just silently.
-    //
-    // Which error comes back is a separate question from whether the call is
-    // refused: a name with no compiled-in descriptor is not a blocked mutation
-    // but an absent method, and answering -32601 for it keeps read-only mode
-    // reporting the same thing read-write mode would. Without that split, a
-    // Linux client asking for `handles.check` (a `.read` method compiled out
-    // by `macOSOnly`) would be told its read was refused as a mutation.
-    if readOnly && !kReadOnlyRPCMethods.contains(method) {
-      if !request.isNotification {
-        let error =
-          rpcMethodIsDispatchable(method)
-          ? RPCError.readOnly(method)
-          : RPCError.methodNotFound(method)
-        output.sendError(id: id, error: error)
-      }
-      return .completed
-    }
-
-    do {
-      guard let route = rpcDispatchRoutes[method] else {
-        if !request.isNotification {
-          output.sendError(id: id, error: RPCError.methodNotFound(method))
-        }
-        return .completed
-      }
-      switch route {
-      case .initialize:
-        try await handleInitialize(id: id, params: params)
-      case .status:
-        try await handleStatus(id: id, params: params)
-      case .chatsList:
-        try await handleChatsList(id: id, params: params)
-      case .messagesStats:
-        try await handleMessagesStats(id: id, params: params)
-      case .messagesHistory:
-        try await handleMessagesHistory(id: id, params: params)
-      case .messagesSearch:
-        try await handleMessagesSearch(id: id, params: params)
-      case .messagesAfter:
-        try await handleMessagesAfter(id: id, params: params)
-      case .watchSubscribe:
-        try await handleWatchSubscribe(id: id, params: params)
-      case .bridgeEventsSubscribe:
-        try await handleBridgeEventsSubscribe(id: id, params: params)
-      case .watchUnsubscribe:
-        try await handleWatchUnsubscribe(id: id, params: params)
-      case .send:
-        try await handleSend(params: params, id: id)
-      case .sendTracked:
-        try await handleSendTracked(params: params, id: id)
-      case .sendRich:
-        try await handleSendRich(params: params, id: id)
-      case .sendAttachment:
-        try await handleSendAttachment(params: params, id: id)
-      case .sendMultipart:
-        try await handleSendMultipart(params: params, id: id)
-      case .sendSticker:
-        try await handleSendSticker(params: params, id: id)
-      case .messagesScheduled:
-        try await handleMessagesScheduled(params: params, id: id)
-      case .pollSend:
-        try await handlePollSend(params: params, id: id)
-      case .pollVote:
-        try await handlePollVote(params: params, id: id)
-      case .pollUnvote:
-        try await handlePollUnvote(params: params, id: id)
-      case .tapback:
-        try await handleTapback(params: params, id: id)
-      case .typing:
-        try await handleTyping(params: params, id: id)
-      case .read:
-        try await handleRead(params: params, id: id)
-      case .messageEdit:
-        try await handleMessageEdit(params: params, id: id)
-      case .messageUnsend:
-        try await handleMessageUnsend(params: params, id: id)
-      case .messageDelete:
-        try await handleMessageDelete(params: params, id: id)
-      case .messageNotifyAnyways:
-        try await handleMessageNotifyAnyways(params: params, id: id)
-      case .messageSendStatus:
-        try await handleMessageSendStatus(params: params, id: id)
-      case .chatsCreate:
-        try await handleChatsCreate(id: id, params: params)
-      case .chatsDelete:
-        try await handleChatsDelete(id: id, params: params)
-      case .chatsMarkUnread:
-        try await handleChatsMarkUnread(id: id, params: params)
-      case .groupRename:
-        try await handleGroupRename(id: id, params: params)
-      case .groupSetIcon:
-        try await handleGroupSetIcon(id: id, params: params)
-      case .groupAddParticipant:
-        try await handleGroupAddParticipant(id: id, params: params)
-      case .groupRemoveParticipant:
-        try await handleGroupRemoveParticipant(id: id, params: params)
-      case .groupLeave:
-        try await handleGroupLeave(id: id, params: params)
-      case .contactsShouldShare:
-        try await handleNamePhotoStatus(params: params, id: id)
-      case .contactsShare:
-        try await handleNamePhotoShare(params: params, id: id)
-      case .handlesCheck:
-        try await handleHandlesCheck(params: params, id: id)
-      }
-    } catch is CancellationError {
-      return .completed
-    } catch let signal as RPCMutationPoisonSignal {
-      return .deliveryFailure(signal.failure)
-    } catch let failure as DeliveryFailure {
-      if !request.isNotification {
-        output.sendError(id: id, error: RPCError.deliveryFailure(failure))
-      }
-      return .deliveryFailure(failure)
-    } catch let err as RPCError {
-      if !request.isNotification {
-        output.sendError(id: id, error: err)
-      }
-    } catch let err as IMsgError {
-      guard !request.isNotification else { return .completed }
-      if err.isCallerCausedRPCError {
-        output.sendError(id: id, error: RPCError.invalidParams(err.localizedDescription))
-      } else {
-        output.sendError(id: id, error: RPCError.internalError(err.localizedDescription))
-      }
-    } catch {
-      if !request.isNotification {
-        output.sendError(id: id, error: RPCError.internalError(error.localizedDescription))
-      }
-    }
-    return .completed
-  }
-
-  func rejectBusy(_ line: String) {
-    switch RPCRequestParser.parse(line) {
-    case .success(let request):
-      if !request.isNotification {
-        output.sendError(
-          id: request.id,
-          error: RPCError.serverBusy("outstanding request limit exceeded")
-        )
-      }
-    case .failure(let failure):
-      if failure.shouldRespond {
-        output.sendError(id: failure.id, error: failure.error)
-      }
-    }
-  }
-
-  func rejectMutationBlocked(_ line: String, poison: DeliveryFailure) {
-    guard case .success(let request) = RPCRequestParser.parse(line) else { return }
-    if !request.isNotification {
-      output.sendError(id: request.id, error: RPCError.mutationLaneBlocked(poison))
-    }
   }
 
   static func resolveSentMessage(
@@ -465,17 +266,5 @@ final class RPCServer: @unchecked Sendable {
       chatID: chatID,
       sentAt: sentAt
     )
-  }
-}
-
-extension IMsgError {
-  fileprivate var isCallerCausedRPCError: Bool {
-    switch self {
-    case .invalidISODate, .invalidService, .unsupportedService, .invalidChatTarget,
-      .invalidReaction, .unsupportedReaction, .chatNotFound:
-      return true
-    case .permissionDenied, .appleScriptFailure, .typingIndicatorFailed:
-      return false
-    }
   }
 }

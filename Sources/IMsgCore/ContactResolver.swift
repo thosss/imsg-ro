@@ -22,10 +22,16 @@ public struct ContactMatch: Equatable, Sendable {
 
 public protocol ContactResolving: Sendable {
   var contactsUnavailable: Bool { get }
+  /// A view for optional live metadata. Catalog-backed resolvers refresh in the background.
+  var cached: any ContactResolving { get }
 
   func displayName(for handle: String) -> String?
   func displayNames(for handles: [String]) -> [String: String]
   func searchByName(_ query: String) -> [ContactMatch]
+}
+
+extension ContactResolving {
+  public var cached: any ContactResolving { self }
 }
 
 public final class NoOpContactResolver: ContactResolving, Sendable {
@@ -67,6 +73,7 @@ public final class ContactResolver: ContactResolving, @unchecked Sendable {
     let now: () -> TimeInterval
     let normalizer = PhoneNumberNormalizer()
     let condition = NSCondition()
+    let refreshQueue = DispatchQueue(label: "imsg.contacts.refresh", qos: .utility)
     let defaultRegion: String
 
     var records: [ContactCatalogRecord] = []
@@ -75,7 +82,8 @@ public final class ContactResolver: ContactResolving, @unchecked Sendable {
     var nextRefreshAt: TimeInterval = -.infinity
     var invalidated = true
     var refreshing = false
-    var authorizationWasAvailable = false
+    var lastAuthorization: ContactCatalogAuthorization?
+    var authorizationGeneration: UInt64 = 0
     var hasLastGoodCatalog = false
     var unavailable = true
     var cancelObservation: (() -> Void)?
@@ -108,11 +116,16 @@ public final class ContactResolver: ContactResolving, @unchecked Sendable {
   ) async -> any ContactResolving {
     #if os(macOS)
       let store = CNContactStore()
+      let environment = ProcessInfo.processInfo.environment
+      let isSSH = environment["SSH_CONNECTION"] != nil || environment["SSH_CLIENT"] != nil
       let initialStatus = CNContactStore.authorizationStatus(for: .contacts)
-      if initialStatus == .notDetermined, accessPolicy == .requestIfNeeded {
+      if initialStatus == .notDetermined, accessPolicy == .requestIfNeeded, !isSSH {
         _ = await requestAccess(store: store)
       }
-      return ContactResolver(region: region, source: contactSource(store: store))
+      let nativeSource = contactSource(store: store)
+      let source =
+        isSSH ? nativeSource.allowingAddressBook(at: AddressBookContacts.directory) : nativeSource
+      return ContactResolver(region: region, source: source)
     #else
       _ = region
       _ = accessPolicy
@@ -148,6 +161,14 @@ public final class ContactResolver: ContactResolving, @unchecked Sendable {
       return snapshot(region: defaultRegion).unavailable
     #else
       return true
+    #endif
+  }
+
+  public var cached: any ContactResolving {
+    #if os(macOS)
+      return ContactRegionResolver(owner: self, region: defaultRegion, waitForRefresh: false)
+    #else
+      return self
     #endif
   }
 

@@ -13,7 +13,7 @@ You almost certainly do not need any of this for normal use.
 
 - `imsg read --to <handle> [--chat-id <id>]` — mark a chat as read.
 - `imsg typing --to <handle> [--duration 5s] [--stop true]` — show or stop the typing indicator.
-- `imsg launch [--dylib <path>] [--kill-only]` — launch Messages.app with the helper dylib injected.
+- `imsg launch [--dylib <path>] [--kill-only] [--force]` — launch Messages.app with the helper dylib injected.
 - `imsg status` — read-only IMCore bridge status.
 - `imsg name-photo status|share --chat <guid>` — inspect the native offer
   eligibility or explicitly share your Messages Name & Photo with a chat.
@@ -63,7 +63,53 @@ Source installs need one extra step first:
 make build-dylib   # produces .build/release/imsg-bridge-helper.dylib (arm64e)
 ```
 
+Resolved native replies use ordinary message construction with a native thread
+identifier, so their outgoing bubbles remain visible in Messages. Maintainers
+can run `make test-native-replies` to check plain, threaded, and multipart text
+construction against the installed IMCore framework. The probe uses synthetic
+messages without opening `chat.db`, resolving a conversation, or sending. It
+checks construction, not recipient delivery, and also runs in macOS CI.
+
 `imsg launch` refuses to inject when SIP is enabled. There's no override.
+
+After a CLI upgrade, `imsg launch` replaces an injected helper whose release
+version differs from the CLI or predates version reporting. Matching helpers
+are reused; `--force` restarts Messages even when the version matches. Version
+checks and replacement share the launch lock, so concurrent launches reuse the
+first caller's updated helper. Standalone `make build-dylib` builds generate
+the helper and CLI version markers from `version.env` before compilation.
+
+Library clients can still call or store the synchronous and asynchronous
+`MessagesLauncher.ensureRunning()` methods as no-argument functions. The
+version-aware overloads also accept `expectedHelperVersion` and `force`.
+
+`imsg status` shows the running helper version and warns on a mismatch.
+JSON output includes `helper_version` when reported and
+`helper_version_mismatch` when it differs from the CLI or a successful probe
+omits the version. Status remains read-only; run `imsg launch` to update the helper.
+
+Each container has one active helper. Additional instances using the same updated
+helper wait without changing readiness or consuming requests, then take over
+when the owner exits. The owner also restores a ready marker removed during
+launcher cleanup. The `.imsg-bridge-owner.lock` file is permanent; do not delete it
+while a helper is running.
+
+Older injected helpers do not participate in ownership locking. After upgrading,
+run `imsg launch` to replace them before using advanced operations. A patched
+helper cannot exclude an older helper that is still running.
+
+Launch waits up to 15 seconds for the bridge-ready file. On a host with slower
+cold starts, extend that wait for the CLI or its supervisor:
+
+```bash
+IMSG_LAUNCH_READY_TIMEOUT=60 imsg launch --json
+```
+
+The value is a positive number of seconds, capped at 600. Invalid or non-positive
+values use the 15-second default. This also applies to library and bridge calls
+that launch Messages. A timeout still returns an error: Messages may still be
+starting, so check `imsg status` before relaunching. The timeout setting does not
+bypass the SIP or permission checks.
 
 `imsg status` is read-only. It does not auto-launch or auto-inject. Run `imsg launch` first.
 
@@ -153,7 +199,9 @@ cannot preserve the private audio-message flag.
 
 `send-sticker` is always bridge-only and iMessage-only. It accepts PNG/APNG,
 GIF, and JPEG images up to 500 KiB, 618x618 pixels, 100 frames, and 25 million
-total decoded pixels. It reads every frame without following symlinks and
+total decoded pixels. Inputs must be regular files; pipes, devices, and paths
+through symlinks (including `link/../image.png`) are rejected before sending.
+It reads every frame without following symlinks and
 stages a private snapshot under Messages' attachments directory. Content
 bytes—not the filename—define sticker identity. `--attach-to`
 optionally associates the sticker with an exact bubble part; `--target-part`

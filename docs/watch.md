@@ -12,6 +12,7 @@ imsg watch --json
 ```
 
 You'll see every new inbound and outbound message across every chat the database covers.
+Each physical message is emitted once. If Messages links a row to multiple chats, an all-chat watch uses its lowest linked chat ID; `--chat-id` preserves the requested chat's context.
 
 ## Stream one chat
 
@@ -31,7 +32,7 @@ imsg watch --chat-id 42 --since-rowid 9000 --json
 
 `--since-rowid` is exclusive: `9000` means "everything strictly after rowid 9000."
 
-If you don't pass `--since-rowid`, watch starts at the newest message at the moment of launch. Messages written before then are not replayed; use [`history`](history.md) for that.
+If you omit `--since-rowid` or pass `0`, watch starts at the newest message at the moment of launch. Messages written before then are not replayed; use [`history`](history.md) for that.
 
 ROWID cursors belong to one database generation. After replacing or restoring
 `chat.db`, discard cursors from the previous file and choose a starting cursor
@@ -96,9 +97,9 @@ could look like a direct message.
 - CLI default: `250ms`.
 - RPC default: `500ms` (RPC's typical caller is an agent more sensitive to outbound echo races).
 
-Lower the debounce if you need lower latency and can tolerate occasional duplicate emissions during database churn. Raise it if downstream consumers can't keep up.
+Lower the debounce if you need lower latency; raise it to give Messages more time to finish related database updates. Debounce controls event-triggered reads, not the rate at which a backlog is delivered.
 
-`--debounce` accepts Go-style durations: `100ms`, `1s`, `2s500ms`.
+`--debounce` accepts non-negative durations in `ms`, `s`, `m`, and `h`, including compounds such as `2s500ms`. Bare numbers are seconds. Invalid, non-finite, and out-of-range values are rejected.
 
 ## RPC backpressure and overflow
 
@@ -135,6 +136,13 @@ macOS sometimes drops or coalesces filesystem events — especially under heavy 
 `imsg watch` runs a low-frequency poll alongside the event watcher. If the cursor falls behind the actual rowid, the poller catches up and emits the missed rows. You don't configure this — it's always on.
 Each fallback poll also refreshes the file watches, so a rotated `chat.db-wal` or
 `chat.db-shm` is reopened without needing an external `touch chat.db`.
+Once a read advances the cursor, watch continues draining the backlog in bounded batches without waiting for another filesystem event or fallback interval.
+
+Contact names are best-effort metadata in both CLI and RPC watches. The watcher
+uses the last available Contacts catalog while a single background refresh runs;
+before the first catalog loads, names may be absent. A stalled Contacts read does
+not hold up message delivery or unsubscribe. Raw sender handles, message IDs,
+original timestamps, and replay cursors are preserved.
 
 This is the fix for the long-standing "watch goes silent after a while" class of bug. See `CHANGELOG.md` 0.6.0 entry.
 

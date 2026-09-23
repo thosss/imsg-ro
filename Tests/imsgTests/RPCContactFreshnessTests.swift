@@ -55,7 +55,10 @@ import Testing
       store: store,
       verbose: false,
       output: output,
-      sendMessage: { sent = $0 },
+      sendMessage: {
+        sent = $0
+        return $0
+      },
       resolveSentMessage: resolvedSentMessageFixture,
       isBridgeReady: { false },
       contactResolver: contacts
@@ -98,6 +101,10 @@ import Testing
       #"{"jsonrpc":"2.0","id":"before","method":"status","params":{}}"#)
     source.setAuthorization(.authorized)
     clock.advance()
+    // The first status starts a background refresh; later status sees its published catalog.
+    await server.handleLineForTesting(
+      #"{"jsonrpc":"2.0","id":"refresh","method":"status","params":{}}"#)
+    #expect(contacts.contactsUnavailable == false)
     await server.handleLineForTesting(
       #"{"jsonrpc":"2.0","id":"after","method":"status","params":{}}"#)
 

@@ -87,6 +87,27 @@ struct IMsgBridgeProtocolTests {
     #expect(response.error == "Chat not found")
   }
 
+  @Test(arguments: [
+    Double.greatestFiniteMagnitude, -Double.greatestFiniteMagnitude,
+    Double.infinity, -Double.infinity, Double.nan,
+    Double(Int.max), Double(Int.min).nextDown, 1.5, -1.5,
+  ])
+  func parseRejectsInvalidNumericIDs(id: Double) {
+    #expect(throws: IMsgBridgeError.malformedResponse("id must be a representable integer")) {
+      try BridgeResponse.parse(["id": id, "success": true])
+    }
+  }
+
+  @Test
+  func parsePreservesLegacyIntegerBoundaries() throws {
+    for id in [Int.min, -1, 0, Int.max] {
+      #expect(try BridgeResponse.parse(["id": id, "success": true]).id == String(id))
+    }
+    #expect(try BridgeResponse.parse(["id": 42.0, "success": true]).id == "42")
+    #expect(
+      try BridgeResponse.parse(["id": Double(Int.min), "success": true]).id == String(Int.min))
+  }
+
   @Test
   func parsePropagatesAuthoritativeDeliveryDisposition() throws {
     let raw: [String: Any] = [
@@ -159,5 +180,13 @@ struct IMsgBridgeProtocolTests {
       MessagesLauncher.shared.sendCommand
     _ = defaultTimeoutSend
     _ = explicitTimeoutSend
+  }
+
+  @Test
+  func messagesLauncherPreservesNoArgumentFunctionReferences() {
+    let synchronous: () throws -> Void = MessagesLauncher.shared.ensureRunning
+    let asynchronous: () async throws -> Void = MessagesLauncher.shared.ensureRunning
+    _ = synchronous
+    _ = asynchronous
   }
 }
