@@ -195,6 +195,9 @@ public struct Chat: Sendable, Equatable {
   public let lastAddressedHandle: String?
   /// Inbound unread row count, or nil when the database has no read state.
   public let unreadCount: Int?
+  /// Messages' filing of the chat: 0 = normal, 1 = Unknown Senders, 2 = Junk.
+  /// nil when the database has no chat.is_filtered column.
+  public let isFiltered: Int?
 
   public init(
     id: Int64,
@@ -205,7 +208,8 @@ public struct Chat: Sendable, Equatable {
     accountID: String? = nil,
     accountLogin: String? = nil,
     lastAddressedHandle: String? = nil,
-    unreadCount: Int? = nil
+    unreadCount: Int? = nil,
+    isFiltered: Int? = nil
   ) {
     self.id = id
     self.identifier = identifier
@@ -216,6 +220,7 @@ public struct Chat: Sendable, Equatable {
     self.accountLogin = accountLogin
     self.lastAddressedHandle = lastAddressedHandle
     self.unreadCount = unreadCount
+    self.isFiltered = isFiltered
   }
 }
 

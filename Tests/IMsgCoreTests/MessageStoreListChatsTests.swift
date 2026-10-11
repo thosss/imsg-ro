@@ -64,6 +64,34 @@ func listChatsUsesChatMessageJoinDateWithoutMessageJoinWhenAvailable() throws {
   #expect(chats.first?.accountID == nil)
   #expect(chats.first?.accountLogin == nil)
   #expect(chats.first?.lastAddressedHandle == nil)
+  #expect(chats.first?.isFiltered == nil)
+}
+
+@Test
+func listChatsReportsMessagesFiling() throws {
+  let db = try Connection(.inMemory)
+  try db.execute(
+    """
+    CREATE TABLE chat (
+      ROWID INTEGER PRIMARY KEY, chat_identifier TEXT, guid TEXT,
+      display_name TEXT, service_name TEXT, is_filtered INTEGER
+    );
+    CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER, message_date INTEGER);
+    INSERT INTO chat VALUES
+      (1, '+111', 'iMessage;-;+111', '', 'iMessage', 0),
+      (2, '22395', 'SMS;-;22395', '', 'SMS', 1),
+      (3, '+222', 'iMessage;-;+222', '', 'iMessage', 2),
+      (4, '+333', 'iMessage;-;+333', '', 'iMessage', NULL);
+    INSERT INTO chat_message_join VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4);
+    """
+  )
+  let store = try MessageStore(connection: db, path: ":memory:")
+  let filed = Dictionary(
+    uniqueKeysWithValues: try store.listChats(limit: 10).map { ($0.id, $0.isFiltered) })
+  #expect(filed[1] == 0)
+  #expect(filed[2] == 1)
+  #expect(filed[3] == 2)
+  #expect(filed[4] == .some(nil))
 }
 
 @Test(arguments: [false, true])

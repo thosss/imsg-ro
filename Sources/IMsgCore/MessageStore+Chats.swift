@@ -5,6 +5,7 @@ private struct ChatRoutingSelection {
   let accountIDColumn: String
   let accountLoginColumn: String
   let lastAddressedHandleColumn: String
+  let isFilteredColumn: String
 
   init(schema: MessageStoreSchema) {
     self.accountIDColumn = schema.hasChatAccountIDColumn ? "IFNULL(c.account_id, '')" : "''"
@@ -12,6 +13,8 @@ private struct ChatRoutingSelection {
       schema.hasChatAccountLoginColumn ? "IFNULL(c.account_login, '')" : "''"
     self.lastAddressedHandleColumn =
       schema.hasChatLastAddressedHandleColumn ? "IFNULL(c.last_addressed_handle, '')" : "''"
+    // Messages' own filing: 0 = normal, 1 = Unknown Senders, 2 = Junk.
+    self.isFilteredColumn = schema.hasChatIsFilteredColumn ? "c.is_filtered" : "NULL"
   }
 }
 
@@ -29,7 +32,8 @@ private struct ListChatsQuery {
                MAX(cmj.message_date) AS last_date,
                \(routing.accountIDColumn) AS account_id,
                \(routing.accountLoginColumn) AS account_login,
-               \(routing.lastAddressedHandleColumn) AS last_addressed_handle
+               \(routing.lastAddressedHandleColumn) AS last_addressed_handle,
+               \(routing.isFilteredColumn) AS is_filtered
         FROM chat c
         JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
         \(unreadSelection.joinClause)
@@ -44,7 +48,8 @@ private struct ListChatsQuery {
                MAX(m.date) AS last_date,
                \(routing.accountIDColumn) AS account_id,
                \(routing.accountLoginColumn) AS account_login,
-               \(routing.lastAddressedHandleColumn) AS last_addressed_handle
+               \(routing.lastAddressedHandleColumn) AS last_addressed_handle,
+               \(routing.isFilteredColumn) AS is_filtered
         FROM chat c
         JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
         JOIN message m ON m.ROWID = cmj.message_id
@@ -109,6 +114,7 @@ private struct ChatRow {
   let accountID: String?
   let accountLogin: String?
   let lastAddressedHandle: String?
+  let isFiltered: Int?
 }
 
 private struct UnreadStateUnavailableError: LocalizedError, CustomStringConvertible {
@@ -211,7 +217,8 @@ extension MessageStore {
           lastMessageAt: try appleDate(from: int64Value(row, "last_date")),
           accountID: try stringValue(row, "account_id").nilIfEmpty,
           accountLogin: try stringValue(row, "account_login").nilIfEmpty,
-          lastAddressedHandle: try stringValue(row, "last_addressed_handle").nilIfEmpty
+          lastAddressedHandle: try stringValue(row, "last_addressed_handle").nilIfEmpty,
+          isFiltered: try int64Value(row, "is_filtered").map { Int($0) }
         ))
     }
     return result
@@ -227,7 +234,8 @@ extension MessageStore {
       accountID: row.accountID,
       accountLogin: row.accountLogin,
       lastAddressedHandle: row.lastAddressedHandle,
-      unreadCount: supportsUnreadState ? unreadCount ?? 0 : nil
+      unreadCount: supportsUnreadState ? unreadCount ?? 0 : nil,
+      isFiltered: row.isFiltered
     )
   }
 

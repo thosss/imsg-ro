@@ -16,6 +16,7 @@ struct ChatPayload: Codable {
   let accountLogin: String?
   let lastAddressedHandle: String?
   let unreadCount: Int?
+  let isFiltered: Int?
 
   init(
     chat: Chat, chatInfo: ChatInfo? = nil, participants: [String]? = nil, contactName: String? = nil
@@ -36,6 +37,7 @@ struct ChatPayload: Codable {
     self.accountLogin = chatInfo?.accountLogin ?? chat.accountLogin
     self.lastAddressedHandle = chatInfo?.lastAddressedHandle ?? chat.lastAddressedHandle
     self.unreadCount = chat.unreadCount
+    self.isFiltered = chat.isFiltered
   }
 
   enum CodingKeys: String, CodingKey {
@@ -53,6 +55,7 @@ struct ChatPayload: Codable {
     case accountLogin = "account_login"
     case lastAddressedHandle = "last_addressed_handle"
     case unreadCount = "unread_count"
+    case isFiltered = "is_filtered"
   }
 }
 
